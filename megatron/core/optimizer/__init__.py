@@ -104,6 +104,13 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             decoupled_lr_config["min_lr"] = config.decoupled_min_lr
         config_overrides[decoupled_param_key] = decoupled_lr_config
 
+    if config.router_lr is not None:
+        router_lr_config: ParamGroupOverride = {"max_lr": config.router_lr}
+        router_param_key = ParamKey(name="*router*")
+        if config.router_min_lr is not None:
+            router_lr_config["min_lr"] = config.router_min_lr
+        config_overrides[router_param_key] = router_lr_config
+
     return config_overrides
 
 
@@ -227,6 +234,16 @@ def _get_param_groups(
             **param_override,  # keep **param_override last so that users can override other fields.
         }
         param_groups.append(param_group)
+
+    for i, group in enumerate(param_groups):
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f'Param group {i}: {len(group["params"])} params, '
+            f'max_lr={group.get("max_lr")}, min_lr={group.get("min_lr")}, '
+            f'wd_mult={group.get("wd_mult")}, '
+            f'is_expert_parallel={group.get("is_expert_parallel")}',
+        )
 
     return param_groups
 

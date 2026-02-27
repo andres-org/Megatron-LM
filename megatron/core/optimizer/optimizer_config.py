@@ -159,6 +159,14 @@ class OptimizerConfig:
        below this threshold.
     """
 
+    router_lr: Optional[float] = None
+    """Separate learning rate for MoE router parameters."""
+
+    router_min_lr: Optional[float] = None
+    """Minimum learning rate for MoE router parameters. The scheduler clips values
+       below this threshold.
+    """
+
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
 
