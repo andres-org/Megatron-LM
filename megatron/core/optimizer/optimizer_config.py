@@ -281,6 +281,19 @@ class OptimizerConfig:
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
+    # AdEMAMix.
+    ademamix_alpha: float = 2.0
+    """AdEMAMix alpha coefficient mixing the slow and fast EMAs."""
+
+    ademamix_beta3: float = 0.9999
+    """AdEMAMix beta3 parameter for slow momentum."""
+
+    ademamix_beta3_warmup: Optional[int] = None
+    """Number of warmup steps used to increase beta3."""
+
+    ademamix_alpha_warmup: Optional[int] = None
+    """Number of warmup steps used to increase alpha."""
+
     #######################
     # Distributed optimizer
     #######################

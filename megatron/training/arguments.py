@@ -1187,6 +1187,12 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
 
+    # AdEMAMix: convert -1 warmup args to None
+    if args.ademamix_beta3_warmup == -1:
+        args.ademamix_beta3_warmup = None
+    if args.ademamix_alpha_warmup == -1:
+        args.ademamix_alpha_warmup = None
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -1900,6 +1906,14 @@ def _add_regularization_args(parser):
     group.add_argument('--adam-eps', type=float, default=1e-08,
                        help='Term added to the denominator to improve'
                        'numerical stability')
+    group.add_argument('--ademamix-beta3', type=float, default=0.9999,
+                       help='AdEMAMix beta_3 parameter')
+    group.add_argument('--ademamix-alpha', type=float, default=5,
+                       help='AdEMAMix alpha parameter')
+    group.add_argument('--ademamix-beta3-warmup', type=int, default=-1,
+                       help='AdEMAMix warmup period for beta_3')
+    group.add_argument('--ademamix-alpha-warmup', type=int, default=-1,
+                       help='AdEMAMix warmup period for alpha')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
     group.add_argument('--muon-momentum', type=float, default=0.9,
@@ -2219,7 +2233,7 @@ def _add_training_args(parser):
     group.add_argument('--qk-clip-threshold', type=float, default=100,
                        help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'ademamix'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
