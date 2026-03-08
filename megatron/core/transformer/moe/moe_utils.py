@@ -866,7 +866,7 @@ def apply_router_token_dropping(
 
 
 def expert_max_violation_batchwise(
-    routing_map: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
     num_experts: int,
     total_num_tokens: int,
     topk: int,
@@ -876,7 +876,7 @@ def expert_max_violation_batchwise(
     A perfect balance yields 0. Positive values indicate overloaded experts.
 
     Args:
-        routing_map: Boolean tensor [num_tokens, num_experts] of expert assignments.
+        tokens_per_expert: Float tensor [num_experts] with token counts per expert.
         num_experts: Number of routable (FFN) experts.
         total_num_tokens: Total number of tokens in the micro-batch.
         topk: Number of experts selected per token.
@@ -884,7 +884,6 @@ def expert_max_violation_batchwise(
     Returns:
         Scalar tensor with the maximum violation ratio across all experts.
     """
-    tokens_per_expert = routing_map.sum(dim=0).float()
     effective_total_tokens = total_num_tokens * topk
     ideal_tokens_per_expert = effective_total_tokens / num_experts
     violation_ratios = (tokens_per_expert - ideal_tokens_per_expert) / ideal_tokens_per_expert
@@ -1076,6 +1075,36 @@ def track_moe_metrics(
                     )
 
     clear_aux_losses_tracker()
+
+
+def get_moe_expert_count_metrics(
+    tokens_per_expert: torch.Tensor, topk: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Calculate metrics for MoE routing from global token counts.
+
+    Args:
+        tokens_per_expert (torch.Tensor): Tensor of shape [num_experts] with token counts per
+            expert for the global batch (after all-reduce across DP/TP/CP ranks).
+        topk (int): The number of top experts selected per token.
+
+    Returns:
+        Tuple of (median, std, max, min, max_violation) scalar tensors.
+    """
+    median_tokens_per_expert = tokens_per_expert.median()
+    std_tokens_per_expert = tokens_per_expert.std()
+    max_tokens_per_expert = tokens_per_expert.max()
+    min_tokens_per_expert = tokens_per_expert.min()
+
+    num_experts = tokens_per_expert.shape[0]
+    total_num_tokens = int(tokens_per_expert.sum().item()) // topk
+    max_expert_violation = expert_max_violation_batchwise(
+        tokens_per_expert=tokens_per_expert,
+        num_experts=num_experts,
+        total_num_tokens=total_num_tokens,
+        topk=topk,
+    )
+
+    return median_tokens_per_expert, std_tokens_per_expert, max_tokens_per_expert, min_tokens_per_expert, max_expert_violation
 
 
 def get_updated_expert_bias(
