@@ -223,7 +223,7 @@ def get_megatron_muon_optimizer(
                         opt.initialize_state(p)
 
     optimizers = []
-    muon_lr = config.muon_lr
+    muon_lr = config.muon_lr if config.muon_lr is not None else config.lr
     muon_config = replace(config, lr=muon_lr)
     # record list of non/linear params
     linear_params = []
