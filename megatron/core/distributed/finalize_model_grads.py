@@ -21,6 +21,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 from .. import parallel_state
+from ..num_microbatches_calculator import get_num_microbatches
 from ..transformer.moe.moe_utils import get_moe_expert_count_metrics, get_updated_expert_bias, save_to_aux_losses_tracker
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import (
@@ -309,26 +310,35 @@ def _log_global_router_metrics(model: List[torch.nn.Module], config: Transformer
         return
 
     stacked = torch.stack(tokens_per_expert_list, dim=0).clone()
+    pre_reduce_total = stacked[0].sum().item()
     torch.distributed.all_reduce(
         stacked,
         group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
     )
+    post_reduce_total = stacked[0].sum().item()
+    tp_dp_cp_size = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True).size()
+    if torch.distributed.get_rank() == 0:
+        print(f"[_log_global_router_metrics] pre_reduce_total={pre_reduce_total:.0f}, post_reduce_total={post_reduce_total:.0f}, tp_dp_cp_group_size={tp_dp_cp_size}", flush=True)
 
     num_layers = config.num_layers
     if config.mtp_num_layers is not None:
         num_layers += config.mtp_num_layers
 
+    # track_moe_metrics applies value times loss_scale=1/num_microbatches, so pre-multiply to cancel it out, because this already contains all the necessary information.
+    num_microbatches = get_num_microbatches()
     with torch.no_grad():
         for module, global_tokens_per_expert in zip(router_modules, stacked):
             median, std, max_tok, min_tok, max_violation = get_moe_expert_count_metrics(
                 global_tokens_per_expert, module.topk
             )
+            if torch.distributed.get_rank() == 0:
+                print(f"[_log_global_router_metrics] layer={module.layer_number} median={median.item():.0f} max={max_tok.item():.0f} min={min_tok.item():.0f}", flush=True)
             layer = module.layer_number
-            save_to_aux_losses_tracker("global_tokens_per_expert_median", median, layer, num_layers)
-            save_to_aux_losses_tracker("global_tokens_per_expert_std", std, layer, num_layers)
-            save_to_aux_losses_tracker("global_tokens_per_expert_max", max_tok, layer, num_layers)
-            save_to_aux_losses_tracker("global_tokens_per_expert_min", min_tok, layer, num_layers)
-            save_to_aux_losses_tracker("global_expert_max_violation", max_violation, layer, num_layers)
+            save_to_aux_losses_tracker("global_tokens_per_expert_median", median * num_microbatches, layer, num_layers, reduce_group_has_dp=True)
+            save_to_aux_losses_tracker("global_tokens_per_expert_std", std * num_microbatches, layer, num_layers, reduce_group_has_dp=True)
+            save_to_aux_losses_tracker("global_tokens_per_expert_max", max_tok * num_microbatches, layer, num_layers, reduce_group_has_dp=True)
+            save_to_aux_losses_tracker("global_tokens_per_expert_min", min_tok * num_microbatches, layer, num_layers, reduce_group_has_dp=True)
+            save_to_aux_losses_tracker("global_expert_max_violation", max_violation * num_microbatches, layer, num_layers, reduce_group_has_dp=True)
 
 
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
