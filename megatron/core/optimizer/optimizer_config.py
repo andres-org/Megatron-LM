@@ -257,6 +257,9 @@ class OptimizerConfig:
 
     # Muon.
     # TODO: move muon configs to it's own `MuonConfig`.
+    muon_lr: Optional[float] = None
+    """Learning rate for Muon parameter groups. If None, this should be set to `lr`."""
+
     muon_momentum: float = 0.95
     """The momentum used by the internal SGD."""
 
