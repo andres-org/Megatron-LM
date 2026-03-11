@@ -691,6 +691,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
+    moe_deepep_dispatch_config: Optional[List[int]] = None
+    """DeepEP dispatch config as a list of ints: [num_sms, nvl_send, nvl_recv, rdma_send, rdma_recv].
+    If None, uses DeepEP defaults."""
+
+    moe_deepep_combine_config: Optional[List[int]] = None
+    """DeepEP combine config as a list of ints: [num_sms, nvl_send, nvl_recv, rdma_send, rdma_recv].
+    If None, uses DeepEP defaults."""
+
     moe_hybridep_num_sms: int = 16
     """Number of SMs to use for HybridEP. In pure NVL scenarios,
     16 SMs can generally achieve good bandwidth."""
@@ -875,6 +883,7 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
         if self.fp16 and self.bf16:
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."

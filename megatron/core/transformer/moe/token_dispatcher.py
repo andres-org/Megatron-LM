@@ -22,6 +22,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     fused_dispatch,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
+    set_deepep_configs,
     set_deepep_num_sms,
 )
 from megatron.core.transformer.moe.moe_utils import (
@@ -1150,7 +1151,12 @@ class _DeepepManager(_DispatchManager):
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
-        set_deepep_num_sms(config.moe_deepep_num_sms)
+        if config.moe_deepep_dispatch_config is None and config.moe_deepep_combine_config is None:
+            set_deepep_num_sms(config.moe_deepep_num_sms)
+        set_deepep_configs(
+            dispatch_config=config.moe_deepep_dispatch_config,
+            combine_config=config.moe_deepep_combine_config,
+        )
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]

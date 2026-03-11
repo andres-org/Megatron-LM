@@ -1304,6 +1304,31 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 
+def _parse_deepep_config(config_str):
+    """Parse DeepEP config string to list of ints.
+
+    Args:
+        config_str: Comma-separated string of ints: num_sms,nvl_send,nvl_recv[,rdma_send,rdma_recv]
+                   RDMA values default to 6,256 if not provided.
+
+    Returns:
+        List of 5 ints or None if config_str is None.
+    """
+    if config_str is None:
+        return None
+    values = [int(x) for x in config_str.split(',')]
+    if len(values) == 3:
+        num_sms, nvl_send, nvl_recv = values
+        return [num_sms, nvl_send, nvl_recv, 6, 256]
+    elif len(values) == 5:
+        return values
+    else:
+        raise ValueError(
+            f"Expected 3 or 5 values for deepep config, got {len(values)}. "
+            "Format: num_sms,nvl_send,nvl_recv[,rdma_send,rdma_recv]"
+        )
+
+
 def core_transformer_config_from_args(args, config_class=None):
 
     # Config class.
@@ -1367,6 +1392,9 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['is_hybrid_model'] = args.is_hybrid_model
 
     kw_args['inference_sampling_seed'] = args.seed
+
+    kw_args['moe_deepep_dispatch_config'] = _parse_deepep_config(args.moe_deepep_dispatch_config)
+    kw_args['moe_deepep_combine_config'] = _parse_deepep_config(args.moe_deepep_combine_config)
 
     # handle quantization config
     # NOTE: Kitchen arguments are only added to the namespace when
@@ -3081,6 +3109,14 @@ def _add_moe_args(parser):
                        help='The backend to use for flex token dispatcher. The default is "deepep". Options are "deepep" and "hybridep".')
     group.add_argument('--moe-deepep-num-sms', type=int, default=20,
                        help='Number of SMs to use for DeepEP.')
+    group.add_argument('--moe-deepep-dispatch-config', type=str, default=None,
+                       help='DeepEP dispatch config as comma-separated ints: '
+                            'num_sms,nvl_send,nvl_recv[,rdma_send,rdma_recv]. '
+                            'RDMA values default to 0 if not provided.')
+    group.add_argument('--moe-deepep-combine-config', type=str, default=None,
+                       help='DeepEP combine config as comma-separated ints: '
+                            'num_sms,nvl_send,nvl_recv[,rdma_send,rdma_recv]. '
+                            'RDMA values default to 0 if not provided.')
     group.add_argument('--moe-hybridep-num-sms', type=int, default=16,
                        help='Number of SMs to use for HybridEP.')
     group.add_argument('--moe-permute-fusion', action='store_true',
