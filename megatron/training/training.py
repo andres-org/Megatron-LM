@@ -1964,27 +1964,6 @@ def training_log(
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
         track_names.append("expert_max_violation")
-        track_names.append("tokens_per_expert_avg")
-        track_names.append("tokens_per_expert_std")
-        track_names.append("tokens_per_expert_max")
-        track_names.append("tokens_per_expert_min")
-        track_names.append("std_score_for_experts")
-        track_names.append("median_score_for_experts")
-        track_names.append("max_score_for_experts")
-        track_names.append("min_score_for_experts")
-        track_names.append("std_score_all_experts")
-        track_names.append("median_score_all_experts")
-        track_names.append("max_score_all_experts")
-        track_names.append("min_score_all_experts")
-        if args.moe_router_enable_expert_bias:
-            track_names.append("mean_all_experts_bias")
-            track_names.append("std_all_experts_bias")
-            track_names.append("max_all_experts_bias")
-            track_names.append("min_all_experts_bias")
-        track_names.append("global_tokens_per_expert_median")
-        track_names.append("global_tokens_per_expert_std")
-        track_names.append("global_tokens_per_expert_max")
-        track_names.append("global_tokens_per_expert_min")
         track_names.append("global_expert_max_violation")
 
         if args.is_hybrid_model:

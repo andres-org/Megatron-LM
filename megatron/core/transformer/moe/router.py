@@ -597,7 +597,6 @@ class TopKRouter(Router):
             )
 
         # Apply each aux loss type and attach aux loss autograd function to probs
-        scores_for_aux_loss = None
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
             # Calculate scores and routing_map for aux loss
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
@@ -631,8 +630,7 @@ class TopKRouter(Router):
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
-        # Log expert max violation metric and token count stats (logging only, no gradient impact)
-        # NOTE: The reduce will be wrong when using tp or cp
+        # Log expert max violation metric (logging only, no gradient impact)
         if self.training and torch.is_grad_enabled():
             with torch.no_grad():
                 num_layers = self.config.num_layers
@@ -652,135 +650,6 @@ class TopKRouter(Router):
                     num_layers,
                     reduce_group=self.tp_cp_group,
                 )
-                save_to_aux_losses_tracker(
-                    "tokens_per_expert_median",
-                    tokens_per_expert.median(),
-                    self.layer_number,
-                    num_layers,
-                    reduce_group=self.tp_cp_group,
-                )
-                save_to_aux_losses_tracker(
-                    "tokens_per_expert_std",
-                    tokens_per_expert.std(),
-                    self.layer_number,
-                    num_layers,
-                    reduce_group=self.tp_cp_group,
-                )
-                save_to_aux_losses_tracker(
-                    "tokens_per_expert_max",
-                    tokens_per_expert.max(),
-                    self.layer_number,
-                    num_layers,
-                    reduce_group=self.tp_cp_group,
-                )
-                save_to_aux_losses_tracker(
-                    "tokens_per_expert_min",
-                    tokens_per_expert.min(),
-                    self.layer_number,
-                    num_layers,
-                    reduce_group=self.tp_cp_group,
-                )
-
-                # Score stats for the selected K experts per token.
-                # NOTE: The reduce is incorrect for std/median/max/min (but we don't have tp or cp)
-                selected = probs > 0
-                selected_scores = probs[selected].view(logits.shape[0], -1)
-                if self.config.moe_router_topk_scaling_factor:
-                    selected_scores = selected_scores / self.config.moe_router_topk_scaling_factor
-                save_to_aux_losses_tracker(
-                    "std_score_for_experts",
-                    selected_scores.std(dim=1).mean(),
-                    self.layer_number,
-                    num_layers,
-                    reduce_group=self.tp_cp_group,
-                )
-                save_to_aux_losses_tracker(
-                    "median_score_for_experts",
-                    selected_scores.median(dim=1).values.mean(),
-                    self.layer_number,
-                    num_layers,
-                    reduce_group=self.tp_cp_group,
-                )
-                save_to_aux_losses_tracker(
-                    "max_score_for_experts",
-                    selected_scores.max(dim=1).values.mean(),
-                    self.layer_number,
-                    num_layers,
-                    reduce_group=self.tp_cp_group,
-                )
-                save_to_aux_losses_tracker(
-                    "min_score_for_experts",
-                    selected_scores.min(dim=1).values.mean(),
-                    self.layer_number,
-                    num_layers,
-                    reduce_group=self.tp_cp_group,
-                )
-
-                # Score stats across all experts (not just selected topk). Only available with aux loss.
-                if scores_for_aux_loss is not None:
-                    all_scores = scores_for_aux_loss.view(logits.shape[0], -1)
-                    if self.config.moe_router_topk_scaling_factor:
-                        all_scores = all_scores / self.config.moe_router_topk_scaling_factor
-                    save_to_aux_losses_tracker(
-                        "std_score_all_experts",
-                        all_scores.std(dim=1).mean(),
-                        self.layer_number,
-                        num_layers,
-                        reduce_group=self.tp_cp_group,
-                    )
-                    save_to_aux_losses_tracker(
-                        "median_score_all_experts",
-                        all_scores.median(dim=1).values.mean(),
-                        self.layer_number,
-                        num_layers,
-                        reduce_group=self.tp_cp_group,
-                    )
-                    save_to_aux_losses_tracker(
-                        "max_score_all_experts",
-                        all_scores.max(dim=1).values.mean(),
-                        self.layer_number,
-                        num_layers,
-                        reduce_group=self.tp_cp_group,
-                    )
-                    save_to_aux_losses_tracker(
-                        "min_score_all_experts",
-                        all_scores.min(dim=1).values.mean(),
-                        self.layer_number,
-                        num_layers,
-                        reduce_group=self.tp_cp_group,
-                    )
-
-                # Expert bias stats.
-                if self.enable_expert_bias:
-                    bias = self.expert_bias
-                    save_to_aux_losses_tracker(
-                        "mean_all_experts_bias",
-                        bias.mean(),
-                        self.layer_number,
-                        num_layers,
-                        reduce_group=self.tp_cp_group,
-                    )
-                    save_to_aux_losses_tracker(
-                        "std_all_experts_bias",
-                        bias.std(),
-                        self.layer_number,
-                        num_layers,
-                        reduce_group=self.tp_cp_group,
-                    )
-                    save_to_aux_losses_tracker(
-                        "max_all_experts_bias",
-                        bias.max(),
-                        self.layer_number,
-                        num_layers,
-                        reduce_group=self.tp_cp_group,
-                    )
-                    save_to_aux_losses_tracker(
-                        "min_all_experts_bias",
-                        bias.min(),
-                        self.layer_number,
-                        num_layers,
-                        reduce_group=self.tp_cp_group,
-                    )
 
         return probs, routing_map
 

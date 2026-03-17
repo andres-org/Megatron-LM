@@ -22,7 +22,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 
 from .. import parallel_state
 from ..num_microbatches_calculator import get_num_microbatches
-from ..transformer.moe.moe_utils import get_moe_expert_count_metrics, get_updated_expert_bias, save_to_aux_losses_tracker
+from ..transformer.moe.moe_utils import expert_max_violation_batchwise, get_updated_expert_bias, save_to_aux_losses_tracker
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import (
     get_attr_wrapped_model,
@@ -294,7 +294,7 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
 
 def _log_global_router_metrics(model: List[torch.nn.Module], config: TransformerConfig):
     """
-    Log global-batch MoE routing metrics (tokens per expert, max violation) for all MoE routers.
+    Log global-batch MoE routing metrics (expert max violation) for all MoE routers.
     Performs an all-reduce of local_tokens_per_expert across TPxCPxDP ranks, then logs via
     save_to_aux_losses_tracker. Called for all routers regardless of whether expert bias is used.
     """
@@ -323,14 +323,14 @@ def _log_global_router_metrics(model: List[torch.nn.Module], config: Transformer
     num_microbatches = get_num_microbatches()
     with torch.no_grad():
         for module, global_tokens_per_expert in zip(router_modules, stacked):
-            median, std, max_tok, min_tok, max_violation = get_moe_expert_count_metrics(
-                global_tokens_per_expert, module.topk
+            total_num_tokens = int(global_tokens_per_expert.sum().item()) // module.topk
+            max_violation = expert_max_violation_batchwise(
+                tokens_per_expert=global_tokens_per_expert,
+                num_experts=global_tokens_per_expert.shape[0],
+                total_num_tokens=total_num_tokens,
+                topk=module.topk,
             )
             layer = module.layer_number
-            save_to_aux_losses_tracker("global_tokens_per_expert_median", median * num_microbatches, layer, num_layers, reduce_group_has_dp=True)
-            save_to_aux_losses_tracker("global_tokens_per_expert_std", std * num_microbatches, layer, num_layers, reduce_group_has_dp=True)
-            save_to_aux_losses_tracker("global_tokens_per_expert_max", max_tok * num_microbatches, layer, num_layers, reduce_group_has_dp=True)
-            save_to_aux_losses_tracker("global_tokens_per_expert_min", min_tok * num_microbatches, layer, num_layers, reduce_group_has_dp=True)
             save_to_aux_losses_tracker("global_expert_max_violation", max_violation * num_microbatches, layer, num_layers, reduce_group_has_dp=True)
 
 

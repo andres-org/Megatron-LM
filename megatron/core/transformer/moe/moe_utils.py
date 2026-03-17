@@ -1077,36 +1077,6 @@ def track_moe_metrics(
     clear_aux_losses_tracker()
 
 
-def get_moe_expert_count_metrics(
-    tokens_per_expert: torch.Tensor, topk: int
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Calculate metrics for MoE routing from global token counts.
-
-    Args:
-        tokens_per_expert (torch.Tensor): Tensor of shape [num_experts] with token counts per
-            expert for the global batch (after all-reduce across DP/TP/CP ranks).
-        topk (int): The number of top experts selected per token.
-
-    Returns:
-        Tuple of (median, std, max, min, max_violation) scalar tensors.
-    """
-    median_tokens_per_expert = tokens_per_expert.median()
-    std_tokens_per_expert = tokens_per_expert.std()
-    max_tokens_per_expert = tokens_per_expert.max()
-    min_tokens_per_expert = tokens_per_expert.min()
-
-    num_experts = tokens_per_expert.shape[0]
-    total_num_tokens = int(tokens_per_expert.sum().item()) // topk
-    max_expert_violation = expert_max_violation_batchwise(
-        tokens_per_expert=tokens_per_expert,
-        num_experts=num_experts,
-        total_num_tokens=total_num_tokens,
-        topk=topk,
-    )
-
-    return median_tokens_per_expert, std_tokens_per_expert, max_tokens_per_expert, min_tokens_per_expert, max_expert_violation
-
-
 def get_updated_expert_bias(
     tokens_per_expert: torch.Tensor, expert_bias: torch.Tensor, expert_bias_update_rate: float
 ) -> torch.Tensor:
