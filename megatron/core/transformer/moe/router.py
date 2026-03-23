@@ -637,10 +637,13 @@ class TopKRouter(Router):
                 if self.config.mtp_num_layers is not None:
                     num_layers += self.config.mtp_num_layers
 
+                # Don't count the padding tokens in the max violation calculation.
                 if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask.unsequeeze(-1))
+                    expert_max_violation_routing_map = routing_map & (
+                        ~padding_mask.unsequeeze(-1)
+                    )
 
-                tokens_per_expert = routing_map.sum(dim=0).float()
+                tokens_per_expert = expert_max_violation_routing_map.sum(dim=0).float()
                 max_violation = expert_max_violation_batchwise(
                     tokens_per_expert=tokens_per_expert,
                     num_experts=self.config.num_moe_experts,
