@@ -3,7 +3,6 @@
 """Megatron muon optimizer wrapper to handle tensor-parallel."""
 
 import logging
-from dataclasses import replace
 from typing import Any, Callable, Dict, List, Literal, Optional
 
 import torch
@@ -223,8 +222,6 @@ def get_megatron_muon_optimizer(
                         opt.initialize_state(p)
 
     optimizers = []
-    muon_lr = config.muon_lr if config.muon_lr is not None else config.lr
-    muon_config = replace(config, lr=muon_lr)
     # record list of non/linear params
     linear_params = []
     nonlinear_params = []
@@ -261,7 +258,7 @@ def get_megatron_muon_optimizer(
                 nonlinear_params.append(param)
 
     muon_kwargs = {
-        "lr": muon_lr,
+        "lr": config.lr,
         "momentum_beta": config.muon_momentum,
         "use_nesterov": config.muon_use_nesterov,
         "weight_decay": config.weight_decay,
@@ -280,7 +277,7 @@ def get_megatron_muon_optimizer(
     for param in nonlinear_params:
         param.requires_grad = False
 
-    linear_param_groups = _get_param_groups(model_chunks, muon_config, config_overrides)
+    linear_param_groups = _get_param_groups(model_chunks, config, config_overrides)
     # if layerwise distributed optimizer is not used, need to handle ep params separately
     expert_param_groups = []
     if not layer_wise_distributed_optimizer:
