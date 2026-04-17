@@ -1191,6 +1191,7 @@ def pretrain(
             )
 
         print_datetime('after training is done')
+        assert False
 
         if not args.skip_train and args.save and iteration != 0 and iteration % args.save_interval != 0:
             save_checkpoint(
