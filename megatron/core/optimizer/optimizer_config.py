@@ -263,6 +263,9 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_mla_per_head: bool = False
+    """Whether to split MLA up-projection parameters per attention head for Muon optimizer (GLM-5 style)."""
+
     muon_use_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
