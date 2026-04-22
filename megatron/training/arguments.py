@@ -2226,6 +2226,11 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-split-mla-per-head', action='store_true', default=False,
+                       dest='muon_split_mla_per_head',
+                       help='Whether to split MLA up-projection parameters per attention head '
+                       'for Muon optimizer (GLM-5 style). Splits linear_q_up_proj and '
+                       'linear_kv_up_proj per head rather than total K/V rows.')
     group.add_argument('--muon-use-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
