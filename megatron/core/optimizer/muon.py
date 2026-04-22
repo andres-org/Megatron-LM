@@ -184,9 +184,6 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 logging.DEBUG,
                 f'kv_up_proj split grad shape {grad_shape}, split shapes {self.kv_up_proj_split_shapes}',
             )
-            logger.warning(
-                f'kv_up_proj split grad shape {grad_shape}, split shapes {self.kv_up_proj_split_shapes}'
-            )
             num_groups = grad_shape[0] // sum(self.kv_up_proj_split_shapes)
             # Reshape to [num_groups, K_rows + V_rows, hidden_size], split into K and V blocks,
             # orthogonalize each independently, then concat and reshape back.
@@ -414,6 +411,17 @@ def get_megatron_muon_optimizer(
         nonlinear_init_state_fn
     ]
     optimizers += chained_adam.chained_optimizers
+
+    if config.muon_split_qkv and getattr(model_chunks[0].config, 'multi_latent_attention', False):
+        has_kv_up_proj = any(
+            'linear_kv_up_proj.weight' in name
+            for model_chunk in model_chunks
+            for name, _ in model_chunk.named_parameters()
+        )
+        assert has_kv_up_proj, (
+            "muon_split_qkv is enabled but no linear_kv_up_proj.weight param found. "
+            "Ensure the model uses MLA with linear_kv_up_proj."
+        )
 
     if layer_wise_distributed_optimizer:
         log_single_rank(logger, logging.INFO, 'Using LayerWiseDistributedOptimizer for Muon')

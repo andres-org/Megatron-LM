@@ -677,6 +677,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             if hasattr(param, 'shared'):
                                 main_param.shared = param.shared
+                            for attr in ('is_qkv', 'is_kv_up_proj', 'expert_tp', 'partition_dim'):
+                                if hasattr(param, attr):
+                                    setattr(main_param, attr, getattr(param, attr))
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
 
