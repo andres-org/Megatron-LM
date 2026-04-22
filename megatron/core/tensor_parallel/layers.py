@@ -60,6 +60,7 @@ except ImportError:
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
+    "is_kv_up_proj": False,
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,
