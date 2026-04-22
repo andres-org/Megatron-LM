@@ -64,6 +64,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         qkv_split_shapes: tuple[int, int, int] | None = None,
         is_kv_up_proj_fn: Callable[[torch.Tensor], bool] | None = None,
         kv_up_proj_split_shapes: tuple[int, int] | None = None,
+        is_qkv_down_proj_fn: Callable[[torch.Tensor], bool] | None = None,
+        qkv_down_proj_split_shapes: tuple[int, int] | None = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -107,6 +109,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.qkv_split_shapes = qkv_split_shapes
         self.is_kv_up_proj_fn = is_kv_up_proj_fn
         self.kv_up_proj_split_shapes = kv_up_proj_split_shapes
+        self.is_qkv_down_proj_fn = is_qkv_down_proj_fn
+        self.qkv_down_proj_split_shapes = qkv_down_proj_split_shapes
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         super().__init__(
@@ -201,6 +205,23 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 for g in kv_grads
             ]
             grad = torch.cat(kv_grads, dim=1).view(grad_shape)
+        elif self.split_qkv and self.is_qkv_down_proj_fn is not None and self.is_qkv_down_proj_fn(p):  # type: ignore[misc]
+            # MLA fused path: split linear_qkv_down_proj into Q and KV (KV includes RoPE dim)
+            # shape: [q_lora_rank + kv_lora_rank + qk_pos_emb_head_dim, hidden_size], out_shape: [q_lora_rank, hidden_size] and [kv_lora_rank + qk_pos_emb_head_dim, hidden_size]
+            # split shapes: (q_lora_rank, kv_lora_rank + qk_pos_emb_head_dim)
+            grad_shape = grad.shape
+            log_single_rank(
+                logger,
+                logging.DEBUG,
+                f'qkv_down_proj split grad shape {grad_shape}, split shapes {self.qkv_down_proj_split_shapes}',
+            )
+            qkv_down_grads = torch.split(grad, self.qkv_down_proj_split_shapes, dim=0)
+
+            qkv_down_grads = [
+                self.scaled_orthogonalize_fn(g, tp_group, partition_dim)
+                for g in qkv_down_grads
+            ]
+            grad = torch.cat(qkv_down_grads, dim=0)
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
@@ -298,10 +319,16 @@ def get_megatron_muon_optimizer(
         ]
         # MLA kv_up_proj split shapes: [num_heads * qk_head_dim, num_heads * v_head_dim]
         mla_config = model_chunk.config
+        is_mla = getattr(mla_config, 'multi_latent_attention', False)
         kv_up_proj_split_shapes = (
             num_attention_heads * mla_config.qk_head_dim,
             num_attention_heads * mla_config.v_head_dim,
-        ) if getattr(mla_config, 'multi_latent_attention', False) else None
+        ) if is_mla else None
+        # MLA fused down proj split shapes: (q_lora_rank, kv_lora_rank + qk_pos_emb_head_dim)
+        qkv_down_proj_split_shapes = (
+            mla_config.q_lora_rank,
+            mla_config.kv_lora_rank + mla_config.qk_pos_emb_head_dim,
+        ) if is_mla and getattr(mla_config, 'q_lora_rank', None) is not None else None
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
@@ -316,6 +343,8 @@ def get_megatron_muon_optimizer(
                 param.is_qkv = True
             if 'linear_kv_up_proj.weight' in name and len(param.shape) == 2:
                 param.is_kv_up_proj = True
+            if 'linear_qkv_down_proj.weight' in name and len(param.shape) == 2:
+                param.is_qkv_down_proj = True
             # TODO(deyuf): currently only allow 2D non-embedding weight to avoid breaking
             if (
                 not getattr(param, 'is_embedding_or_output_parameter', False)
@@ -338,6 +367,8 @@ def get_megatron_muon_optimizer(
         "qkv_split_shapes": qkv_split_shapes,
         "is_kv_up_proj_fn": lambda p: getattr(p, "is_kv_up_proj", False),
         "kv_up_proj_split_shapes": kv_up_proj_split_shapes,
+        "is_qkv_down_proj_fn": lambda p: getattr(p, "is_qkv_down_proj", False),
+        "qkv_down_proj_split_shapes": qkv_down_proj_split_shapes,
         "extra_scale_factor": config.muon_extra_scale_factor,
         "pg_collection": pg_collection,
         "mode": config.muon_tp_mode,
