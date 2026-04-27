@@ -3,10 +3,12 @@
 
 import pytest
 import torch
+from unittest.mock import Mock
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -135,6 +137,34 @@ class TestParallelTransformerLayer:
     def test_get_layer_offset(self):
         config = self.parallel_transformer_layer.config
         assert get_transformer_layer_offset(config) == 0
+
+    def test_forward_passes_packed_seq_params_only_to_mlp_path(self):
+        layer = self.parallel_transformer_layer
+        packed_seq_params = PackedSeqParams(qkv_format="thd", packed_batch_size=2)
+        hidden_states = torch.ones((3, 1, layer.config.hidden_size))
+        attention_mask = torch.ones((1, 1, 3, 3), dtype=torch.bool)
+        attention_output = torch.zeros_like(hidden_states)
+
+        attention_mock = Mock(return_value=(attention_output, None))
+        mlp_mock = Mock(return_value=attention_output)
+        layer._forward_attention = attention_mock
+        layer._forward_mlp = mlp_mock
+
+        output, context = layer.forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
+        )
+
+        assert output is attention_output
+        assert context is None
+        attention_mock.assert_called_once()
+        mlp_mock.assert_called_once_with(
+            attention_output,
+            None,
+            padding_mask=None,
+            packed_seq_params=packed_seq_params,
+        )
 
     @pytest.mark.parametrize(
         "config_params,expected_offsets",

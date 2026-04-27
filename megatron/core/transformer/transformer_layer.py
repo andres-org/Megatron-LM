@@ -705,6 +705,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
+            packed_seq_params=kwargs.get("packed_seq_params", None),
         )
         return output, context
 
@@ -730,6 +731,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_states: Tensor,
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -777,6 +779,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
         )
+        packed_batch_size = (
+            packed_seq_params.packed_batch_size if packed_seq_params is not None else None
+        )
 
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
@@ -790,10 +795,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
                     padding_mask=padding_mask,
+                    packed_batch_size=packed_batch_size,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(self.mlp, padding_mask=padding_mask),
+                    functools.partial(
+                        self.mlp,
+                        padding_mask=padding_mask,
+                        packed_batch_size=packed_batch_size,
+                    ),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -815,7 +825,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            mlp_output_with_bias = self.mlp(
+                pre_mlp_layernorm_output,
+                padding_mask=padding_mask,
+                packed_batch_size=packed_batch_size,
+            )
 
         nvtx_range_pop(suffix="mlp")
 
@@ -1383,7 +1397,7 @@ class MoETransformerLayer(TransformerLayer):
         ):
             self.transition_cudagraph_scope('partial')
 
-    def _forward_mlp_router(self, hidden_states, padding_mask=None):
+    def _forward_mlp_router(self, hidden_states, padding_mask=None, packed_batch_size=None):
         """
         Executes the router phase of the MoE block.
 
@@ -1408,7 +1422,10 @@ class MoETransformerLayer(TransformerLayer):
             residual = residual.float()
 
         router_outputs = self.mlp(
-            pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
+            pre_mlp_layernorm_output,
+            intermediate_tensors=(),
+            padding_mask=padding_mask,
+            packed_batch_size=packed_batch_size,
         )
 
         for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
@@ -1463,7 +1480,9 @@ class MoETransformerLayer(TransformerLayer):
         output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
         return self._forward_post_mlp((output, mlp_bias), residual)
 
-    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
+    def _forward_mlp(
+        self, hidden_states, inference_context=None, padding_mask=None, packed_batch_size=None
+    ):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
 
@@ -1479,10 +1498,12 @@ class MoETransformerLayer(TransformerLayer):
             )
 
         def _forward_mlp_partial_cudagraphs(
-            hidden_states, inference_context=None, padding_mask=None
+            hidden_states, inference_context=None, padding_mask=None, packed_batch_size=None
         ):
             residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(
-                hidden_states, padding_mask=padding_mask
+                hidden_states,
+                padding_mask=padding_mask,
+                packed_batch_size=packed_batch_size,
             )
 
             # After the router graph replays, the captured .copy_() operations that update
@@ -1511,16 +1532,27 @@ class MoETransformerLayer(TransformerLayer):
                         parallel_state.get_tensor_model_parallel_group(),
                         hidden_states,
                         padding_mask=padding_mask,
+                        packed_batch_size=packed_batch_size,
                     )
                 else:
                     return tensor_parallel.checkpoint(
                         functools.partial(
-                            _forward_mlp_partial_cudagraphs, padding_mask=padding_mask
+                            _forward_mlp_partial_cudagraphs,
+                            padding_mask=padding_mask,
+                            packed_batch_size=packed_batch_size,
                         ),
                         False,
                         hidden_states,
                     )
             else:
-                return _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
+                return _forward_mlp_partial_cudagraphs(
+                    hidden_states,
+                    padding_mask=padding_mask,
+                    packed_batch_size=packed_batch_size,
+                )
         else:
-            return super()._forward_mlp(hidden_states, padding_mask=padding_mask)
+            return super()._forward_mlp(
+                hidden_states,
+                padding_mask=padding_mask,
+                packed_batch_size=packed_batch_size,
+            )

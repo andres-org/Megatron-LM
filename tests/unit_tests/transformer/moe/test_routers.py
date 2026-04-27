@@ -496,6 +496,155 @@ class TestAuxLossFreeTop2Router:
             torch.testing.assert_close(scores_ref, scores_fused)
 
 
+class TestPackedBatchSizeRouter:
+    """Tests for packed_batch_size support in TopKRouter.
+
+    When using packed sequences with mbs>1, the input to the router has shape
+    [total_seq_len, 1, hidden] where total_seq_len = real_seq_len * packed_batch_size.
+    The packed_batch_size argument lets the router recover the real (seq_length, bsz)
+    dimensions so that seq_aux_loss reshapes correctly inside _apply_seq_aux_loss.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        num_moe_experts = 4
+        self.transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=num_moe_experts,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0.01,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=num_moe_experts, moe_grouped_gemm=False
+        )
+        self.moe_layer = MoELayer(self.transformer_config, submodules.mlp.submodules)
+        self.router = cast(Router, self.moe_layer.router)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_packed_routing_output_shape(self):
+        """packed_batch_size does not change output tensor shapes."""
+        self.router = self.router.cuda()
+        seq_len = 32
+        packed_batch_size = 4
+        hidden_states = torch.randn(
+            (seq_len * packed_batch_size, 1, self.router.config.hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        with torch.no_grad():
+            probs, routing_map = self.router(hidden_states, packed_batch_size=packed_batch_size)
+
+        total_tokens = seq_len * packed_batch_size
+        assert probs.shape == (total_tokens, self.router.config.num_moe_experts)
+        assert routing_map.shape == (total_tokens, self.router.config.num_moe_experts)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_packed_routing_matches_unpacked(self):
+        """Token routing decisions must be identical between packed and unpacked inputs.
+
+        [seq*bsz, 1, H] with packed_batch_size=bsz should give the same routing_map
+        as [seq, bsz, H] without packed_batch_size because both collapse to the same
+        flat [num_tokens, num_experts] logits.
+        """
+        self.router = self.router.cuda()
+        seq_len = 8
+        bsz = 4
+
+        hidden_states = torch.randn(
+            (seq_len, bsz, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        hidden_packed = hidden_states.reshape(seq_len * bsz, 1, self.router.config.hidden_size)
+
+        with torch.no_grad():
+            _, routing_unpacked = self.router(hidden_states)
+            _, routing_packed = self.router(hidden_packed, packed_batch_size=bsz)
+
+        assert torch.equal(routing_unpacked, routing_packed), (
+            "Routing maps should be identical between packed and unpacked inputs"
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_seq_aux_loss_uses_correct_seq_length(self):
+        """packed_batch_size must cause _apply_seq_aux_loss to see (seq_len, bsz), not (seq_len*bsz, 1).
+
+        _apply_seq_aux_loss does scores.reshape(seq_length, -1) and then divides the loss
+        by bsz. If seq_length were wrong (seq*bsz instead of seq), the reshape would
+        produce a different second dimension and the division by bsz would be off.
+
+        We verify by comparing the router weight gradients from two identical routers
+        given identical data — one via unpacked [seq, bsz, H], the other via packed
+        [seq*bsz, 1, H] with packed_batch_size=bsz.  The gradients must match exactly.
+        """
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=self.transformer_config.num_moe_experts, moe_grouped_gemm=False
+        )
+        seq_len = 8
+        bsz = 4
+
+        def make_router():
+            layer = MoELayer(self.transformer_config, submodules.mlp.submodules).cuda().train()
+            return layer.router
+
+        router_a = make_router()
+        router_b = make_router()
+        router_b.weight.data.copy_(router_a.weight.data)
+
+        hidden = torch.randn(
+            (seq_len, bsz, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        hidden_packed = hidden.reshape(seq_len * bsz, 1, self.router.config.hidden_size)
+
+        probs_a, _ = router_a(hidden)
+        probs_a.sum().backward()
+
+        probs_b, _ = router_b(hidden_packed, packed_batch_size=bsz)
+        probs_b.sum().backward()
+
+        torch.testing.assert_close(
+            router_a.weight.grad,
+            router_b.weight.grad,
+            msg="Gradients must match: packed and unpacked paths use the same seq_length/bsz split",
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_packed_bsz_assertion_requires_bsz1(self):
+        """packed_batch_size is only valid when the batch dimension is exactly 1."""
+        self.router = self.router.cuda()
+        hidden_states = torch.randn(
+            (16, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        with pytest.raises(AssertionError, match="dummy batch dimension of 1"):
+            with torch.no_grad():
+                self.router(hidden_states, packed_batch_size=2)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_packed_bsz_assertion_divisibility(self):
+        """seq_length must be exactly divisible by packed_batch_size."""
+        self.router = self.router.cuda()
+        hidden_states = torch.randn(
+            (10, 1, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        with pytest.raises(AssertionError, match="divisible by packed_batch_size"):
+            with torch.no_grad():
+                self.router(hidden_states, packed_batch_size=3)
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("router_dtype", [torch.bfloat16, torch.float32, torch.float64])

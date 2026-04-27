@@ -131,8 +131,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
     max_seqlen = batch.pop('max_seqlen', None)
     local_cp_size = batch.pop('local_cp_size', None)
+    packed_batch_size = batch.pop('packed_batch_size', None)
     if local_cp_size is not None:
         local_cp_size = int(local_cp_size.item())
+    if packed_batch_size is not None:
+        packed_batch_size = int(packed_batch_size.item())
 
     if cu_seqlens is not None:
         assert (
@@ -150,6 +153,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             max_seqlen_q=int(max_seqlen[0].item()),
             max_seqlen_kv=int(max_seqlen[0].item()),
             qkv_format='thd',
+            packed_batch_size=packed_batch_size,
         )
 
     if cu_seqlens is None and local_cp_size is None:
@@ -157,7 +161,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
     elif local_cp_size is None:  # Packed THD format
-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
+        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
+            batch,
+            cu_seqlens,
+            cu_seqlens_padded,
+            max_seqlen,
+            packed_batch_size=packed_batch_size,
+        )
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
 
@@ -286,7 +296,12 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+                    tokens,
+                    position_ids,
+                    attention_mask,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    packed_seq_params=packed_seq_params,
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses

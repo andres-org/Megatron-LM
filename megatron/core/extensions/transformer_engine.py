@@ -1530,6 +1530,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
+        # packed_batch_size is bookkeeping metadata for downstream Megatron modules only.
+        self.kept_packed_seq_params.discard("packed_batch_size")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
