@@ -16,12 +16,66 @@ from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 
 
+def _dataset_uses_packed_sequences(dataset):
+    """Detect packed-sequence datasets from their emitted sample structure."""
+    if len(dataset) == 0:
+        return False
+    sample = dataset[0]
+    return isinstance(sample, dict) and "cu_seqlens" in sample and "max_seqlen" in sample
+
+
+def _packed_collate_fn(batch):
+    """Collate function for packed sequences with variable-length cu_seqlens.
+
+    Concatenates token-aligned per-sample tensors into one dummy-batch packed
+    sample of shape [1, total_tokens]. For cu_seqlens, concatenates per-sample
+    boundaries with offsets so the result describes that merged packed stream.
+    """
+    if "cu_seqlens" not in batch[0]:
+        return torch.utils.data.dataloader.default_collate(batch)
+
+    def _as_tensor(value):
+        return value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+
+    seq_length = _as_tensor(batch[0]["tokens"]).numel()
+
+    merged_cu_seqlens = [0]
+    merged_max_seqlen = 0
+    for i, sample in enumerate(batch):
+        offset = i * seq_length
+        sample_cu_seqlens = _as_tensor(sample["cu_seqlens"])
+        sample_max_seqlen = _as_tensor(sample["max_seqlen"])
+        # Skip the leading 0 from every sample after the first and offset the boundaries.
+        merged_cu_seqlens.extend((sample_cu_seqlens[1:] + offset).tolist())
+        merged_max_seqlen = max(merged_max_seqlen, sample_max_seqlen.item())
+
+    result = {}
+    for key in batch[0]:
+        if key == "attention_mask":
+            raise NotImplementedError(
+                "Packed collate does not support attention_mask; disable dataloader attention masks "
+                "when using packed THD batches."
+            )
+        if key == "cu_seqlens":
+            result["cu_seqlens"] = torch.tensor(merged_cu_seqlens, dtype=torch.int32).unsqueeze(0)
+        elif key == "max_seqlen":
+            result["max_seqlen"] = torch.tensor([merged_max_seqlen], dtype=torch.int32)
+        else:
+            result[key] = torch.cat(
+                [_as_tensor(sample[key]).reshape(-1) for sample in batch], dim=0
+            ).unsqueeze(0)
+    result["seq_length"] = torch.tensor([seq_length], dtype=torch.int32) # to be able to get batch a bsz, seq_len from the merged batch if we need to
+    result["packed_batch_size"] = torch.tensor([len(batch)], dtype=torch.int32) # to be able to get batch a bsz, seq_len from the merged batch if we need to
+    return result
+
+
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
 
     if dataset is None:
         return None
     args = get_args()
+    packed = _dataset_uses_packed_sequences(dataset)
 
     if hasattr(dataset, 'split'):
         split = dataset.split
@@ -97,6 +151,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     # Torch dataloader.
     if args.hybrid_context_parallel:
         extra_kwargs = {"collate_fn": lambda x: x,}
+    elif packed:
+        extra_kwargs = {"collate_fn": _packed_collate_fn,}
     else:
         extra_kwargs = {}
     return torch.utils.data.DataLoader(

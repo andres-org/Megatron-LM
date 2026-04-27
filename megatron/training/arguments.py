@@ -1208,6 +1208,17 @@ def validate_args(args, defaults={}):
         assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
         assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
 
+    if args.reset_position_ids:
+        assert (
+            not args.create_attention_mask_in_dataloader
+        ), '--reset-position-ids packed THD path requires --no-create-attention-mask-in-dataloader.'
+        assert (
+            args.tensor_model_parallel_size == 1
+        ), '--reset-position-ids packed THD path does not support tensor parallelism; set --tensor-model-parallel-size 1.'
+        assert (
+            not args.hybrid_context_parallel
+        ), '--reset-position-ids packed THD path does not support hybrid context parallelism.'
+
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
@@ -2881,7 +2892,7 @@ def _add_data_args(parser):
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
     group.add_argument('--reset-position-ids', action='store_true',
-                       help='Reset posistion ids after end-of-document token.')
+                       help='Reset posistion ids after end-of-document token (and force use of PackedSeqParams, needs "--no-create-attention-mask-in-dataloader" to be set).')
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention mask after '
                        'end-of-document token.')

@@ -187,6 +187,41 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
 
 
+def _packed_sequence_active() -> bool:
+    from megatron.training import get_args
+
+    args = get_args()
+    return args.sft or getattr(args, "reset_position_ids", False)
+
+
+def _view_tensor_for_packed_model_input(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Reinterpret PP [s, b, h] activations as packed [t, 1, h] for the model."""
+    if tensor is None or not _packed_sequence_active() or tensor.dim() != 3:
+        return tensor
+    if tensor.shape[1] == 1:
+        return tensor
+    return tensor.contiguous().view(tensor.shape[0] * tensor.shape[1], 1, tensor.shape[2])
+
+
+def _view_tensor_for_pipeline_output(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Reinterpret packed [t, 1, h] activations as PP [s, b, h] for communication."""
+    if tensor is None or not _packed_sequence_active() or tensor.dim() != 3:
+        return tensor
+    if tensor.shape[1] != 1:
+        return tensor
+
+    from megatron.training import get_args
+
+    args = get_args()
+    micro_batch_size = args.micro_batch_size
+    assert (
+        tensor.shape[0] % micro_batch_size == 0
+    ), "Packed pipeline tensor length must be divisible by micro_batch_size."
+    return tensor.contiguous().view(
+        tensor.shape[0] // micro_batch_size, micro_batch_size, tensor.shape[2]
+    )
+
+
 def custom_backward(output, grad_output):
     '''Directly call C++ autograd engine.
 
@@ -416,6 +451,8 @@ def forward_step(
         input_tensor = [input_tensor]
         unwrap_output_tensor = True
 
+    input_tensor = [_view_tensor_for_packed_model_input(tensor) for tensor in input_tensor]
+
     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
     set_input_tensor(input_tensor)
 
@@ -442,6 +479,9 @@ def forward_step(
         cp_group_size,
         is_last_stage,
     )
+
+    if not is_last_stage:
+        output_tensor = _view_tensor_for_pipeline_output(output_tensor)
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens

@@ -1,6 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import os
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -76,6 +78,19 @@ def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
     schedule.deallocate_output_tensor(out)
     assert out.nelement() == 6
+
+
+def test_packed_pipeline_view_helpers():
+    args = SimpleNamespace(sft=False, reset_position_ids=True, micro_batch_size=2)
+
+    with patch('megatron.training.get_args', new=lambda: args):
+        pipeline_tensor = torch.arange(2 * 3 * 4).view(3, 2, 4)
+        packed_tensor = schedule._view_tensor_for_packed_model_input(pipeline_tensor)
+        assert packed_tensor.shape == (6, 1, 4)
+
+        restored_tensor = schedule._view_tensor_for_pipeline_output(packed_tensor)
+        assert restored_tensor.shape == (3, 2, 4)
+        assert torch.equal(restored_tensor, pipeline_tensor)
 
 
 @pytest.mark.internal
