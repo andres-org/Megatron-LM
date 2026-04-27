@@ -12,6 +12,7 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
@@ -91,6 +92,150 @@ def test_packed_pipeline_view_helpers():
         restored_tensor = schedule._view_tensor_for_pipeline_output(packed_tensor)
         assert restored_tensor.shape == (3, 2, 4)
         assert torch.equal(restored_tensor, pipeline_tensor)
+
+
+def test_packed_pipeline_view_helpers_divisibility_assertion():
+    """_view_tensor_for_pipeline_output must assert when total length is not divisible by mbs."""
+    args = SimpleNamespace(sft=True, reset_position_ids=False, micro_batch_size=4)
+    t = torch.randn(6, 1, 4)  # 6 not divisible by 4
+    with patch('megatron.training.get_args', new=lambda: args):
+        with pytest.raises(AssertionError, match="divisible by micro_batch_size"):
+            schedule._view_tensor_for_pipeline_output(t)
+
+
+@pytest.mark.parametrize("mbs", [1, 2, 4])
+def test_forward_step_packed_sequence_tensor_integrity(mocker, mbs):
+    """Verify forward_step correctly converts PP tensors through the packed path.
+
+    A non-last PP stage receives [s, b, h] from the previous stage, must present
+    [s*b, 1, h] to the model, and must return [s, b, h] for the next PP send.
+    We intercept what the model sees via set_input_tensor and what is returned,
+    confirming both shape and data are correct for varying micro_batch_size values.
+    """
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    seq_len, hidden = 3, 4
+    args = SimpleNamespace(sft=True, reset_position_ids=False, micro_batch_size=mbs)
+
+    # PP tensor arriving from the previous stage: [s, b, h]
+    pipeline_tensor = torch.arange(seq_len * mbs * hidden, dtype=torch.float).view(
+        seq_len, mbs, hidden
+    )
+
+    received_by_model = {}
+
+    class FakeModel:
+        config = ModelParallelConfig(pipeline_model_parallel_size=1)
+
+        def set_input_tensor(self, tensors):
+            received_by_model['tensor'] = tensors[0]
+
+    model = FakeModel()
+
+    def forward_step_func(data_iterator, _model):
+        output = received_by_model['tensor']
+
+        def loss_func(t):
+            return t, {'loss': 0}
+
+        return output, loss_func
+
+    mocker.patch("megatron.core.pipeline_parallel.schedules.custom_backward", return_value=None)
+
+    with patch('megatron.training.get_args', new=lambda: args):
+        output, _ = schedule.forward_step(
+            forward_step_func=forward_step_func,
+            data_iterator=iter([None]),
+            model=model,
+            num_microbatches=1,
+            input_tensor=pipeline_tensor,
+            forward_data_store=[],
+            config=model.config,
+            cp_group_size=1,
+            is_last_stage=False,
+        )
+
+    # Model must have received packed [s*b, 1, h] (or [s, 1, h] when mbs==1, already packed)
+    expected_packed_shape = (seq_len * mbs, 1, hidden)
+    assert received_by_model['tensor'].shape == expected_packed_shape, (
+        f"mbs={mbs}: model received {received_by_model['tensor'].shape}, expected {expected_packed_shape}"
+    )
+
+    # Output returned by forward_step must be restored to [s, b, h]
+    assert output.shape == (seq_len, mbs, hidden), (
+        f"mbs={mbs}: forward_step returned {output.shape}, expected ({seq_len}, {mbs}, {hidden})"
+    )
+
+    # Data must be numerically identical after the round-trip view
+    assert torch.equal(output, pipeline_tensor), f"mbs={mbs}: data corrupted by packed view round-trip"
+
+    Utils.destroy_model_parallel()
+
+
+def test_forward_step_packed_last_stage_no_view(mocker):
+    """On the last PP stage the output is NOT re-viewed — loss_func receives packed [s*b, 1, h].
+
+    This matters because the last stage goes straight to the loss function without
+    sending the tensor to another rank, so _view_tensor_for_pipeline_output must NOT
+    be called there.
+    """
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    seq_len, mbs, hidden = 3, 2, 4
+    args = SimpleNamespace(sft=True, reset_position_ids=False, micro_batch_size=mbs)
+
+    pipeline_tensor = torch.arange(seq_len * mbs * hidden, dtype=torch.float).view(
+        seq_len, mbs, hidden
+    )
+
+    received_by_model = {}
+    received_by_loss = {}
+
+    class FakeModel:
+        config = TransformerConfig(
+            num_layers=1, hidden_size=hidden, num_attention_heads=1,
+            pipeline_model_parallel_size=1,
+        )
+
+        def set_input_tensor(self, tensors):
+            received_by_model['tensor'] = tensors[0]
+
+    model = FakeModel()
+
+    def forward_step_func(_data_iterator, _model):
+        output = received_by_model['tensor']
+
+        def loss_func(t):
+            received_by_loss['tensor'] = t
+            loss = t.sum()
+            return loss, {}
+
+        return output, loss_func
+
+    mocker.patch("megatron.core.pipeline_parallel.schedules.custom_backward", return_value=None)
+
+    with patch('megatron.training.get_args', new=lambda: args):
+        schedule.forward_step(
+            forward_step_func=forward_step_func,
+            data_iterator=iter([None]),
+            model=model,
+            num_microbatches=1,
+            input_tensor=pipeline_tensor,
+            forward_data_store=[],
+            config=model.config,
+            cp_group_size=1,
+            is_last_stage=True,
+        )
+
+    # Model must still receive packed input
+    assert received_by_model['tensor'].shape == (seq_len * mbs, 1, hidden)
+
+    # loss_func must also receive packed [s*b, 1, h] — no view back to [s, b, h]
+    assert received_by_loss['tensor'].shape == (seq_len * mbs, 1, hidden), (
+        f"loss_func received {received_by_loss['tensor'].shape}, expected packed ({seq_len*mbs}, 1, {hidden})"
+    )
+
+    Utils.destroy_model_parallel()
 
 
 @pytest.mark.internal
