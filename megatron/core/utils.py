@@ -2021,7 +2021,6 @@ def get_thd_batch_on_this_cp_rank(
     cu_seqlens: torch.Tensor,
     cu_seqlens_padded: torch.Tensor,
     max_seqlen: torch.Tensor,
-    packed_batch_size: Optional[int] = None,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
 ):
@@ -2037,7 +2036,6 @@ def get_thd_batch_on_this_cp_rank(
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=int(max_seqlen[0].item()),
         max_seqlen_kv=int(max_seqlen[0].item()),
-        packed_batch_size=packed_batch_size,
     )
 
     cp_size = parallel_state.get_context_parallel_world_size() if cp_size is None else cp_size

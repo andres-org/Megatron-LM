@@ -937,6 +937,17 @@ class Attention(MegatronModule, ABC):
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
+        # When packed sequences are active with b > 1, transpose to have the samples be contiguous and fold batch into the seq dim so the rest of attention sees the canonical [t, 1, h] (thd) shape.
+        orig_bsz = hidden_states.shape[1]
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and orig_bsz > 1
+        ):
+            sq = hidden_states.shape[0]
+            h = hidden_states.shape[2]
+            hidden_states = hidden_states.transpose(0, 1).contiguous().view(sq * orig_bsz, 1, h)
+
         is_inference_mode = inference_context is not None and not self.training
         # is_using_flash_decode - True is we are using the static inference engine with flash decode
         is_using_flash_decode = is_inference_mode and self.config.flash_decode
@@ -1220,6 +1231,9 @@ class Attention(MegatronModule, ABC):
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
         nvtx_range_pop(suffix="linear_proj")
+
+        if orig_bsz > 1 and packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            output = output.view(orig_bsz, sq, -1).transpose(0, 1).contiguous() # (sq, b, h)
 
         return output, bias
 

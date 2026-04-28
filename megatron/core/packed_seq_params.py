@@ -24,7 +24,6 @@ class PackedSeqParams:
     cp_group: dist.ProcessGroup = None
     total_tokens: int = None
     seq_idx: Tensor = None
-    packed_batch_size: int = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

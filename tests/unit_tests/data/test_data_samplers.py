@@ -59,7 +59,6 @@ def test_packed_collate_fn_merges_cu_seqlens_across_samples():
     )
     assert torch.equal(result["max_seqlen"], torch.tensor([3], dtype=torch.int32))
     assert torch.equal(result["seq_length"], torch.tensor([4], dtype=torch.int32))
-    assert torch.equal(result["packed_batch_size"], torch.tensor([2], dtype=torch.int32))
 
 
 def test_packed_collate_fn_rejects_attention_mask():

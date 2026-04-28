@@ -131,11 +131,10 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
     max_seqlen = batch.pop('max_seqlen', None)
     local_cp_size = batch.pop('local_cp_size', None)
-    packed_batch_size = batch.pop('packed_batch_size', None)
+    batch.pop('packed_batch_size', None)
+    batch.pop('seq_length', None)
     if local_cp_size is not None:
         local_cp_size = int(local_cp_size.item())
-    if packed_batch_size is not None:
-        packed_batch_size = int(packed_batch_size.item())
 
     if cu_seqlens is not None:
         assert (
@@ -153,7 +152,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             max_seqlen_q=int(max_seqlen[0].item()),
             max_seqlen_kv=int(max_seqlen[0].item()),
             qkv_format='thd',
-            packed_batch_size=packed_batch_size,
         )
 
     if cu_seqlens is None and local_cp_size is None:
@@ -162,11 +160,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         packed_seq_params = None
     elif local_cp_size is None:  # Packed THD format
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
-            batch,
-            cu_seqlens,
-            cu_seqlens_padded,
-            max_seqlen,
-            packed_batch_size=packed_batch_size,
+            batch, cu_seqlens, cu_seqlens_padded, max_seqlen
         )
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)

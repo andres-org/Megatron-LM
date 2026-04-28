@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from copy import deepcopy
 
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
@@ -75,6 +76,89 @@ class TestParallelAttentionWithPackedSequence:
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
         pass
+
+    def test_gpu_forward_thd_multi_batch(self):
+        """[sq, b, h] input with b>1 and merged THD packed params: output shape matches input."""
+        self.parallel_attention.cuda()
+        config = self.parallel_attention.config
+
+        sequence_length = 32
+        micro_batch_size = 2
+
+        hidden_states = torch.randn(
+            sequence_length, micro_batch_size, config.hidden_size,
+            dtype=torch.bfloat16, device='cuda',
+        )
+
+        # cu_seqlens must cover the full merged stream of sq*b tokens.
+        single_cu = torch.IntTensor([0, 6, 19, 22, sequence_length]).cuda()
+        merged_cu = torch.cat([single_cu, single_cu[1:] + sequence_length])
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=merged_cu,
+            cu_seqlens_kv=merged_cu,
+            max_seqlen_q=13,
+            max_seqlen_kv=13,
+            qkv_format='thd',
+        )
+        output, bias = self.parallel_attention(
+            hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+
+        assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
+        assert bias.shape == (config.hidden_size,)
+
+    def test_gpu_forward_thd_multi_batch_matches_single_batch(self):
+        """b>1 THD forward matches manually pre-transposed b=1 input with the same merged cu_seqlens."""
+
+        deterministic_config = deepcopy(self.transformer_config)
+        deterministic_config.attention_dropout = 0.0
+        self.parallel_attention = SelfAttention(
+            deterministic_config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        self.parallel_attention.cuda()
+        config = self.parallel_attention.config
+
+        sequence_length = 32
+        micro_batch_size = 2
+
+        torch.manual_seed(42)
+        hidden_states = torch.randn(
+            sequence_length, micro_batch_size, config.hidden_size,
+            dtype=torch.bfloat16, device='cuda',
+        )
+
+        # Build merged cu_seqlens covering sq*b tokens (same as _packed_collate_fn produces).
+        single_cu = torch.IntTensor([0, 6, 19, 22, sequence_length]).cuda()
+        merged_cu = torch.cat([single_cu, single_cu[1:] + sequence_length])
+        merged_params = PackedSeqParams(
+            cu_seqlens_q=merged_cu,
+            cu_seqlens_kv=merged_cu,
+            max_seqlen_q=torch.diff(merged_cu).max().item(),
+            max_seqlen_kv=torch.diff(merged_cu).max().item(),
+            qkv_format='thd',
+        )
+
+        # b>1 forward — internally transposes [sq, b, h] → [sq*b, 1, h] then inverts
+        output_multi, _ = self.parallel_attention(
+            hidden_states, attention_mask=None, packed_seq_params=merged_params
+        )
+
+        # Reference: manually do the same transpose+view and run with b=1
+        hidden_states_thd = hidden_states.transpose(0, 1).contiguous().view(
+            sequence_length * micro_batch_size, 1, config.hidden_size
+        ) # (b, sq, h) -> (b*sq, 1, h)
+        output_ref_thd, _ = self.parallel_attention(
+            hidden_states_thd, attention_mask=None, packed_seq_params=merged_params
+        )
+        output_ref = output_ref_thd.view(
+            micro_batch_size, sequence_length, config.hidden_size
+        ).transpose(0, 1).contiguous()
+
+        torch.testing.assert_close(output_multi, output_ref, atol=1e-3, rtol=1e-3)
 
     def test_gpu_forward(self):
 

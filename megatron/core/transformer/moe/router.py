@@ -112,7 +112,6 @@ class Router(ABC, MegatronModule):
         self,
         logits: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
-        packed_batch_size: Optional[int] = None,
     ):
         """Routing function.
 
@@ -130,7 +129,6 @@ class Router(ABC, MegatronModule):
         self,
         input: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
-        packed_batch_size: Optional[int] = None,
     ):
         """
         Forward pass of the router.
@@ -599,7 +597,6 @@ class TopKRouter(Router):
         self,
         logits: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
-        packed_batch_size: Optional[int] = None,
     ):
         """Top-k routing function
 
@@ -615,13 +612,6 @@ class TopKRouter(Router):
                 with shape [num_tokens, num_experts].
         """
         seq_length, bsz = logits.shape[:2]
-        if packed_batch_size is not None:
-            assert bsz == 1, "Packed MoE routing expects a dummy batch dimension of 1."
-            assert (
-                seq_length % packed_batch_size == 0
-            ), "Packed token count must be divisible by packed_batch_size."
-            bsz = packed_batch_size
-            seq_length = seq_length // packed_batch_size # needed for seq_aux_loss
         logits = logits.view(-1, self.config.num_moe_experts)
 
         # Flatten padding_mask to [num_tokens] if provided
@@ -736,7 +726,6 @@ class TopKRouter(Router):
         self,
         input: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
-        packed_batch_size: Optional[int] = None,
     ):
         """
         Forward pass of the router.
@@ -763,9 +752,7 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(
-            logits, padding_mask=padding_mask, packed_batch_size=packed_batch_size
-        )
+        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
 
         return probs, routing_map
 
@@ -877,7 +864,6 @@ class InferenceTopKRouter(TopKRouter):
         self,
         input: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
-        packed_batch_size: Optional[int] = None,
     ):
         """Simplified forward pass for inference - returns dense tensors only.
 
@@ -890,11 +876,6 @@ class InferenceTopKRouter(TopKRouter):
                 - probs: Normalized routing probabilities [num_tokens, topk]
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
-
-        assert (
-            packed_batch_size is None
-        ), "InferenceTopKRouter does not support packed_batch_size metadata."
-
         if self.training or not self.is_inference_cuda_graphed_iteration:
             return super().forward(input, padding_mask)
 

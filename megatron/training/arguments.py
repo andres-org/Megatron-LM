@@ -1213,9 +1213,6 @@ def validate_args(args, defaults={}):
             not args.create_attention_mask_in_dataloader
         ), '--reset-position-ids packed THD path requires --no-create-attention-mask-in-dataloader.'
         assert (
-            args.tensor_model_parallel_size == 1
-        ), '--reset-position-ids packed THD path does not support tensor parallelism; set --tensor-model-parallel-size 1.'
-        assert (
             not args.hybrid_context_parallel
         ), '--reset-position-ids packed THD path does not support hybrid context parallelism.'
 

@@ -140,7 +140,7 @@ class TestParallelTransformerLayer:
 
     def test_forward_passes_packed_seq_params_only_to_mlp_path(self):
         layer = self.parallel_transformer_layer
-        packed_seq_params = PackedSeqParams(qkv_format="thd", packed_batch_size=2)
+        packed_seq_params = PackedSeqParams(qkv_format="thd")
         hidden_states = torch.ones((3, 1, layer.config.hidden_size))
         attention_mask = torch.ones((1, 1, 3, 3), dtype=torch.bool)
         attention_output = torch.zeros_like(hidden_states)

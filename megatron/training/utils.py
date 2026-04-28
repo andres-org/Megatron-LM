@@ -562,11 +562,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 if "local_cp_size" not in data
                 else data["local_cp_size"].cuda(non_blocking=True)
             ),
-            'packed_batch_size': (
-                None
-                if "packed_batch_size" not in data
-                else data["packed_batch_size"].cuda(non_blocking=True)
-            ),
         }
         if packed_sequence:
             assert batch['attention_mask'] is None, (
@@ -598,7 +593,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
             _broadcast(batch['local_cp_size'])
-            _broadcast(batch['packed_batch_size'])
 
         elif mpu.is_pipeline_first_stage():
             _broadcast(batch['tokens'])
@@ -606,7 +600,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['position_ids'])
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
-            _broadcast(batch['packed_batch_size'])
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -615,7 +608,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
-            _broadcast(batch['packed_batch_size'])
 
     else:
         cu_seqlens = None
@@ -669,11 +661,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 if args.hybrid_context_parallel
                 else None
             )
-            packed_batch_size = (
-                torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
-                if packed_sequence
-                else None
-            )
 
             _broadcast(tokens)
             _broadcast(labels)
@@ -683,7 +670,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
             _broadcast(local_cp_size)
-            _broadcast(packed_batch_size)
 
         elif mpu.is_pipeline_first_stage():
             tokens = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
@@ -706,18 +692,12 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             labels = None
             loss_mask = None
             local_cp_size = None
-            packed_batch_size = (
-                torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
-                if packed_sequence
-                else None
-            )
 
             _broadcast(tokens)
             _broadcast(attention_mask)
             _broadcast(position_ids)
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
-            _broadcast(packed_batch_size)
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -742,16 +722,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             cu_seqlens = None
             max_seqlen = None
             local_cp_size = None
-            packed_batch_size = (
-                torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
-                if packed_sequence
-                else None
-            )
 
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)
-            _broadcast(packed_batch_size)
 
         batch = {
             'tokens': tokens,
@@ -762,7 +736,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'cu_seqlens': cu_seqlens,
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
-            'packed_batch_size': packed_batch_size,
         }
 
     return batch

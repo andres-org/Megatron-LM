@@ -162,7 +162,6 @@ def test_get_batch_on_this_tp_rank_packed_non_src_allocates_dummy_batch():
     assert batch["attention_mask"] is None
     assert batch["cu_seqlens"].shape == (1, 3)
     assert batch["max_seqlen"].shape == (1,)
-    assert batch["packed_batch_size"].shape == (1,)
 
 
 def test_get_batch_on_this_tp_rank_packed_rejects_attention_mask():
@@ -183,7 +182,6 @@ def test_get_batch_on_this_tp_rank_packed_rejects_attention_mask():
         "position_ids": torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.int64),
         "cu_seqlens": torch.tensor([[0, 4, 8]], dtype=torch.int32),
         "max_seqlen": torch.tensor([4], dtype=torch.int32),
-        "packed_batch_size": torch.tensor([2], dtype=torch.int32),
     }
 
     with (
