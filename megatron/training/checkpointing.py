@@ -1514,6 +1514,15 @@ def load_args_from_checkpoint(
     _set_arg('moe_router_enable_expert_bias', force=True)
     _set_arg('moe_router_topk_scaling_factor', force=True)
 
+    # MLA args.
+    _set_arg('multi_latent_attention', force=True)
+    _set_arg('q_lora_rank', force=True)
+    _set_arg('kv_lora_rank', force=True)
+    _set_arg('qk_head_dim', force=True)
+    _set_arg('qk_pos_emb_head_dim', force=True)
+    _set_arg('v_head_dim', force=True)
+    _set_arg('rotary_scaling_factor', force=True)
+
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)
     _set_arg('mamba_head_dim', force=True)
