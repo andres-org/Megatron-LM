@@ -1216,6 +1216,14 @@ def validate_args(args, defaults={}):
             not args.hybrid_context_parallel
         ), '--reset-position-ids packed THD path does not support hybrid context parallelism.'
 
+    if args.use_packed_seq_params:
+        assert (
+            not args.create_attention_mask_in_dataloader
+        ), '--use-packed-seq-params requires --no-create-attention-mask-in-dataloader.'
+        assert (
+            not args.hybrid_context_parallel
+        ), '--use-packed-seq-params does not support hybrid context parallelism.'
+
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
@@ -2890,6 +2898,8 @@ def _add_data_args(parser):
                        help="Dataloader number of workers.")
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token (and force use of PackedSeqParams, needs "--no-create-attention-mask-in-dataloader" to be set).')
+    group.add_argument('--use-packed-seq-params', action='store_true',
+                       help='Force use of PackedSeqParams (THD format). Needs "--no-create-attention-mask-in-dataloader" to be set.')
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention mask after '
                        'end-of-document token.')

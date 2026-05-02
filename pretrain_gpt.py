@@ -115,8 +115,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     args = get_args()
     config = core_transformer_config_from_args(args)
     # Temporary policy: route batches through packed-sequence handling whenever
-    # SFT or reset_position_ids is enabled.
-    is_packed_sequence = get_args().sft or get_args().reset_position_ids
+    # SFT or use_packed_seq_params is enabled.
+    is_packed_sequence = get_args().sft or get_args().use_packed_seq_params
     if not is_first_or_last_pipeline_stage(vp_stage) and not is_packed_sequence and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
         return None, None, None, None, None, None
@@ -391,7 +391,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     config = core_gpt_dataset_config_from_args(args)
 
 
-    is_packed_sequence = args.sft or args.reset_position_ids
+    is_packed_sequence = args.sft or args.use_packed_seq_params
     if args.sft:
         dataset_type = SFTDataset
     else:

@@ -523,7 +523,7 @@ def get_blend_and_blend_per_split(args):
 def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
     args = get_args()
-    packed_sequence = args.sft or getattr(args, "reset_position_ids", False)
+    packed_sequence = args.sft or getattr(args, "use_packed_seq_params", False)
 
     def _broadcast(item):
         if item is not None:
