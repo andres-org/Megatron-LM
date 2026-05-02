@@ -1208,14 +1208,6 @@ def validate_args(args, defaults={}):
         assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
         assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
 
-    if args.reset_position_ids:
-        assert (
-            not args.create_attention_mask_in_dataloader
-        ), '--reset-position-ids packed THD path requires --no-create-attention-mask-in-dataloader.'
-        assert (
-            not args.hybrid_context_parallel
-        ), '--reset-position-ids packed THD path does not support hybrid context parallelism.'
-
     if args.use_packed_seq_params:
         assert (
             not args.create_attention_mask_in_dataloader
