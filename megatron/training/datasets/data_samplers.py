@@ -79,7 +79,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     if dataset is None:
         return None
     args = get_args()
-    packed = _dataset_uses_packed_sequences(dataset)
+    packed = _dataset_uses_packed_sequences(dataset) and args.use_packed_seq_params
 
     if hasattr(dataset, 'split'):
         split = dataset.split
