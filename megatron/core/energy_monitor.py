@@ -36,24 +36,24 @@ class EnergyMonitor:
 
     def setup(self) -> None:
         """Setup the NVML Handler."""
-        if has_nvml:
+        if has_nvml and self._handle is None:
             nvmlInit()
             self._handle = nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
 
     def shutdown(self) -> None:
         """Shutdown NVML."""
-        if has_nvml:
+        if has_nvml and self._handle is not None:
             nvmlShutdown()
 
     def pause(self) -> None:
         """Pause energy monitor (must resume afterward)."""
-        if has_nvml:
+        if has_nvml and self._handle is not None:
             energy = self._get_energy()
             self._lap_energy += energy - self._last_energy
 
     def resume(self) -> None:
         """Resume/start energy monitor."""
-        if has_nvml:
+        if has_nvml and self._handle is not None:
             self._last_energy = self._get_energy()
 
     def _get_energy(self) -> int:
@@ -65,7 +65,7 @@ class EnergyMonitor:
 
     def lap(self) -> float:
         """Returns lap (iteration) energy (J) and updates total energy."""
-        if not has_nvml:
+        if not has_nvml or self._handle is None:
             return 0.0
 
         energy = self._get_energy()
@@ -82,7 +82,7 @@ class EnergyMonitor:
 
     def get_total(self) -> float:
         """Get total energy consumption (J) across all GPUs."""
-        if not has_nvml:
+        if not has_nvml or self._handle is None:
             return 0.0
 
         energy_tensor = torch.tensor([self._total_energy], dtype=torch.int64, device='cuda')

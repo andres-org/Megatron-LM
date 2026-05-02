@@ -442,6 +442,25 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
+
+    # Set CPU affinity to the NUMA node closest to each GPU for optimal performance.
+    _rank = os.environ.get("RANK", "0")
+    try:
+        from megatron.core.pipeline_parallel.utils import (
+            set_ideal_affinity_for_current_gpu,
+        )
+
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        affinity_before = os.sched_getaffinity(0)
+        set_ideal_affinity_for_current_gpu()
+        affinity_after = os.sched_getaffinity(0)
+        cores = sorted(affinity_after)
+        print(
+            f"[Rank {_rank}] CPU affinity: {len(affinity_before)} cores -> {len(affinity_after)} cores (range {cores[0]}-{cores[-1]})"
+        )
+    except Exception as e:
+        print(f"[Rank {_rank}] Could not set CPU affinity: {e}")
+
     pretrain(
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),
