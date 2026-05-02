@@ -28,6 +28,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     reset_position_ids: Optional[bool] = None
     """Option to reset the position IDs in the dataset at an interval"""
 
+    use_packed_seq_params: bool = False
+    """If true, build cu_seqlens and max_seqlen per sample for packed THD attention."""
+
     reset_attention_mask: Optional[bool] = None
     """Option to reset the attention mask from the dataset"""
 
@@ -268,25 +271,6 @@ class GPTDataset(MegatronDataset):
             loss_mask = self.cached_loss_mask.clone()
             position_ids = self.cached_position_ids
         
-        # Build cu_seqlens from EOD token boundaries
-        seq_length = tokens.numel() # total number of tokens
-        eod_positions = (
-            (tokens == self.config.tokenizer.eod).nonzero(as_tuple=False).squeeze(-1)
-        )
-
-        cu_seqlens_list = [0]
-        if eod_positions.numel() > 0:
-            for pos in eod_positions:
-                cu_seqlens_list.append(pos.item() + 1) # [start_pos, start_pos + length) +1 to convert from position to length
-        # Extend last segment to cover remaining tokens (padding or partial doc) (as we didn't found an EOD token at the end)
-        if cu_seqlens_list[-1] != seq_length:
-            cu_seqlens_list.append(seq_length)
-
-        cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32)
-        # adjacent_diffs = cu_seqlens[1:] - cu_seqlens[:-1] # lengths of each segment
-        adjacent_diffs = torch.diff(cu_seqlens) # lengths of each segment
-        max_seqlen = adjacent_diffs.max()  # 0-D tensor
-
         # For padded sequences, mask the loss
         loss_mask[labels == self._pad_token_id] = 0.0
 
@@ -298,25 +282,32 @@ class GPTDataset(MegatronDataset):
         if idx is None:
             loss_mask = torch.zeros_like(loss_mask)
 
+        sample = {
+            "tokens": tokens,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+        }
         if self.config.create_attention_mask:
-            return {
-                "tokens": tokens,
-                "labels": labels,
-                "attention_mask": attention_mask,
-                "loss_mask": loss_mask,
-                "position_ids": position_ids,
-                "cu_seqlens": cu_seqlens,
-                "max_seqlen": max_seqlen,
-            }
-        else:
-            return {
-                "tokens": tokens,
-                "labels": labels,
-                "loss_mask": loss_mask,
-                "position_ids": position_ids,
-                "cu_seqlens": cu_seqlens,
-                "max_seqlen": max_seqlen,
-            }
+            sample["attention_mask"] = attention_mask
+
+        if self.config.use_packed_seq_params:
+            # Build cu_seqlens from EOD token boundaries for packed THD attention
+            seq_length = tokens.numel()
+            eod_positions = (
+                (tokens == self.config.tokenizer.eod).nonzero(as_tuple=False).squeeze(-1)
+            )
+            cu_seqlens_list = [0]
+            if eod_positions.numel() > 0:
+                for pos in eod_positions:
+                    cu_seqlens_list.append(pos.item() + 1)
+            if cu_seqlens_list[-1] != seq_length:
+                cu_seqlens_list.append(seq_length)
+            cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32)
+            sample["cu_seqlens"] = cu_seqlens
+            sample["max_seqlen"] = torch.diff(cu_seqlens).max()
+
+        return sample
 
     def _query_document_sample_shuffle_indices(
         self, idx: int

@@ -341,6 +341,7 @@ def core_gpt_dataset_config_from_args(args):
         "mmap_bin_files": args.mmap_bin_files,
         "tokenizer": tokenizer,
         "reset_position_ids": args.reset_position_ids,
+        "use_packed_seq_params": args.use_packed_seq_params,
         "reset_attention_mask": args.reset_attention_mask,
         "eod_mask_loss": args.eod_mask_loss,
         "create_attention_mask": args.create_attention_mask_in_dataloader,
