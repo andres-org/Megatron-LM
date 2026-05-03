@@ -41,24 +41,28 @@ def test_packed_collate_fn_merges_cu_seqlens_across_samples():
 
     result = _packed_collate_fn(batch)
 
+    # Regular keys are stacked: shape [bsz, seq_len]
     assert torch.equal(
-        result["tokens"], torch.tensor([[10, 11, 12, 13, 20, 21, 22, 23]], dtype=torch.int64)
+        result["tokens"],
+        torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int64),
     )
     assert torch.equal(
-        result["labels"], torch.tensor([[11, 12, 13, 14, 21, 22, 23, 24]], dtype=torch.int64)
+        result["labels"],
+        torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]], dtype=torch.int64),
     )
     assert torch.equal(
         result["loss_mask"],
-        torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1]], dtype=torch.float32),
+        torch.tensor([[1, 1, 1, 1], [1, 1, 1, 1]], dtype=torch.float32),
     )
     assert torch.equal(
-        result["position_ids"], torch.tensor([[0, 1, 0, 1, 0, 1, 2, 0]], dtype=torch.int64)
+        result["position_ids"],
+        torch.tensor([[0, 1, 0, 1], [0, 1, 2, 0]], dtype=torch.int64),
     )
+    # cu_seqlens is merged across samples with offsets: shape [1, total_boundaries]
     assert torch.equal(
         result["cu_seqlens"], torch.tensor([[0, 2, 4, 7, 8]], dtype=torch.int32)
     )
     assert torch.equal(result["max_seqlen"], torch.tensor([3], dtype=torch.int32))
-    assert torch.equal(result["seq_length"], torch.tensor([4], dtype=torch.int32))
 
 
 def test_packed_collate_fn_rejects_attention_mask():
@@ -92,7 +96,7 @@ def test_packed_collate_fn_falls_back_to_default_collate_without_packing_keys():
     assert torch.equal(result["tokens"], torch.tensor([[1, 2], [3, 4]], dtype=torch.int64))
 
 
-def test_build_pretraining_data_loader_uses_packed_collate_when_dataset_emits_packing_keys():
+def test_build_pretraining_data_loader_uses_packed_collate_when_use_packed_seq_params():
     dataset = _TinyDataset(
         [
             {
@@ -114,6 +118,7 @@ def test_build_pretraining_data_loader_uses_packed_collate_when_dataset_emits_pa
         num_workers=0,
         exit_signal_handler=False,
         sft=False,
+        use_packed_seq_params=True,
     )
 
     with (

@@ -61,15 +61,7 @@ def _packed_collate_fn(batch):
         elif key == "max_seqlen":
             result["max_seqlen"] = torch.tensor([merged_max_seqlen], dtype=torch.int32)
         else:
-            result[key] = torch.cat(
-                [_as_tensor(sample[key]).reshape(-1) for sample in batch], dim=0
-            ).unsqueeze(0)
-    result["seq_length"] = torch.tensor(
-        [seq_length], dtype=torch.int32
-    )  # to be able to get batch a bsz, seq_len from the merged batch if we need to
-    result["packed_batch_size"] = torch.tensor(
-        [len(batch)], dtype=torch.int32
-    )  # to be able to get batch a bsz, seq_len from the merged batch if we need to
+            result[key] = torch.stack([_as_tensor(sample[key]) for sample in batch])
     return result
 
 
