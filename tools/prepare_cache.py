@@ -171,7 +171,7 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
             world_size=int(os.environ.get("WORLD_SIZE", 1)),
         )
 
-    assert dist.world_size() == 1, "tools/prepare_cache.py only supports world size of 1"
+    assert dist.get_world_size() == 1, "tools/prepare_cache.py only supports world size of 1"
     assert args.data_parallel_size == 1 and args.tensor_model_parallel_size == 1 and args.pipeline_model_parallel_size == 1 and args.expert_model_parallel_size == 1, "tools/prepare_cache.py only supports data_parallel_size, tensor_model_parallel_size, pipeline_model_parallel_size, and expert_model_parallel_size of 1"
 
     _validate_prepare_cache_args(args)
