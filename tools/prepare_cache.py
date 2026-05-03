@@ -9,6 +9,8 @@ Unsupported configurations:
 import argparse
 import json
 from typing import Any, Dict, List, Optional, Tuple
+import os
+import torch.distributed as dist
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
@@ -162,6 +164,15 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
 
 def build_dataset_caches(args: Any) -> Dict[str, Any]:
     """Build the dataset caches for the plain GPTDataset path."""
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="gloo",
+            rank=int(os.environ.get("RANK", 0)),
+            world_size=int(os.environ.get("WORLD_SIZE", 1)),
+        )
+
+    assert dist.world_size() == 1, "tools/prepare_cache.py only supports world size of 1"
+    assert args.data_parallel_size == 1 and args.tensor_model_parallel_size == 1 and args.pipeline_model_parallel_size == 1 and args.expert_model_parallel_size == 1, "tools/prepare_cache.py only supports data_parallel_size, tensor_model_parallel_size, pipeline_model_parallel_size, and expert_model_parallel_size of 1"
 
     _validate_prepare_cache_args(args)
     ignored_flags = _disable_cache_load_only_flags(args)
