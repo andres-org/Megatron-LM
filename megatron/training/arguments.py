@@ -1215,6 +1215,9 @@ def validate_args(args, defaults={}):
         assert (
             not args.hybrid_context_parallel
         ), '--use-packed-seq-params does not support hybrid context parallelism.'
+        assert (
+            args.tensor_model_parallel_size == 1
+        ), '--use-packed-seq-params does not support tensor model parallelism.'
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
