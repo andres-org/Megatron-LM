@@ -115,10 +115,8 @@ def _get_dataset_length(dataset: Optional[Any]) -> Optional[Any]:
     return len(dataset)
 
 
-def _get_gpt_sample_source_parts(
-    dataset: GPTDataset, local_sample_idx: int
-) -> Tuple[int, List[Dict[str, Any]]]:
-    """Map a GPTDataset sample index to its source sequences and .bin byte offsets."""
+def _ensure_gpt_indices_loaded(dataset: GPTDataset) -> None:
+    """Lazy-load GPTDataset cache indices needed for sample source mapping."""
     if dataset.shuffle_index is None:
         dataset.shuffle_index = np.load(
             dataset.path_to_shuffle_index, allow_pickle=True, mmap_mode="r"
@@ -130,50 +128,49 @@ def _get_gpt_sample_source_parts(
             dataset.path_to_document_index, allow_pickle=True, mmap_mode="r"
         )
 
-    shuffled_sample_idx = int(dataset.shuffle_index[local_sample_idx])
-    doc_index_beg, doc_index_beg_offset = dataset.sample_index[shuffled_sample_idx]
-    doc_index_end, doc_index_end_offset = dataset.sample_index[shuffled_sample_idx + 1]
 
-    source_parts: List[Dict[str, Any]] = []
+def _vectorized_gpt_sample_source_columns(
+    dataset: GPTDataset, local_sample_indices: np.ndarray
+) -> Dict[str, np.ndarray]:
+    """Map GPTDataset sample indices to compact, array-oriented source columns."""
+    _ensure_gpt_indices_loaded(dataset)
+
+    shuffled_sample_indices = np.asarray(dataset.shuffle_index[local_sample_indices], dtype=np.int64)
+    sample_starts = dataset.sample_index[shuffled_sample_indices]
+    sample_ends = dataset.sample_index[shuffled_sample_indices + 1]
+
+    doc_index_beg = np.asarray(sample_starts[:, 0], dtype=np.int64)
+    doc_index_beg_offset = np.asarray(sample_starts[:, 1], dtype=np.int64)
+    doc_index_end = np.asarray(sample_ends[:, 0], dtype=np.int64)
+    doc_index_end_offset = np.asarray(sample_ends[:, 1], dtype=np.int64)
+
+    sequence_id_beg = np.asarray(dataset.document_index[doc_index_beg], dtype=np.int64)
+    sequence_id_end = np.asarray(dataset.document_index[doc_index_end], dtype=np.int64)
+
     low_level_dataset = dataset.dataset
     dtype_size = int(low_level_dataset.index.dtype_size)
+    sequence_pointer_beg = low_level_dataset.index.sequence_pointers[sequence_id_beg]
+    byte_offset_beg = np.asarray(sequence_pointer_beg + doc_index_beg_offset * dtype_size, dtype=np.int64)
 
-    for doc_index in range(int(doc_index_beg), int(doc_index_end) + 1):
-        sequence_id = int(dataset.document_index[doc_index])
-        token_offset = int(doc_index_beg_offset) if doc_index == int(doc_index_beg) else 0
-        if doc_index == int(doc_index_end):
-            token_length = (
-                int(doc_index_end_offset)
-                - token_offset
-                + int(dataset.config.add_extra_token_to_sequence)
-            )
-        else:
-            token_length = int(low_level_dataset.sequence_lengths[sequence_id]) - token_offset
-        sequence_pointer = int(low_level_dataset.index.sequence_pointers[sequence_id])
-        byte_offset = sequence_pointer + token_offset * dtype_size
-
-        source_parts.append(
-            {
-                "sequence_id": sequence_id,
-                "document_index_position": doc_index,
-                "token_offset": token_offset,
-                "token_length": token_length,
-                "byte_offset": byte_offset,
-                "byte_length": token_length * dtype_size,
-                "sequence_pointer": sequence_pointer,
-                "sequence_length": int(low_level_dataset.sequence_lengths[sequence_id]),
-            }
-        )
-
-    return shuffled_sample_idx, source_parts
+    return {
+        "local_sample_idx": local_sample_indices.astype(np.int64),
+        "shuffled_sample_idx": shuffled_sample_indices,
+        "doc_index_beg": doc_index_beg,
+        "doc_index_beg_offset": doc_index_beg_offset,
+        "doc_index_end": doc_index_end,
+        "doc_index_end_offset": doc_index_end_offset,
+        "sequence_id_beg": sequence_id_beg,
+        "sequence_id_end": sequence_id_end,
+        "byte_offset_beg": byte_offset_beg,
+        "num_source_sequences": doc_index_end - doc_index_beg + 1,
+    }
 
 
-def _sample_source_record(dataset: Any, split_name: str, sample_idx: int) -> Dict[str, Any]:
-    """Build one JSON-safe source mapping record for a top-level dataset sample."""
-    blended_dataset_id = None
-    blended_sample_idx = None
-    source_dataset = dataset
-    local_sample_idx = sample_idx
+def _source_columns_for_sample_range(
+    dataset: Any, sample_start: int, sample_end: int
+) -> Tuple[List[Dict[str, Any]], Dict[str, np.ndarray]]:
+    """Build source mapping columns for a contiguous range of global samples."""
+    sample_indices = np.arange(sample_start, sample_end, dtype=np.int64)
 
     if isinstance(dataset, BlendedDataset):
         if dataset.dataset_index is None:
@@ -183,27 +180,81 @@ def _sample_source_record(dataset: Any, split_name: str, sample_idx: int) -> Dic
             dataset.dataset_sample_index = np.load(
                 dataset.path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
             )
-        blended_dataset_id = int(dataset.dataset_index[sample_idx])
-        blended_sample_idx = int(dataset.dataset_sample_index[sample_idx])
-        source_dataset = dataset.datasets[blended_dataset_id]
-        local_sample_idx = blended_sample_idx
 
-    shuffled_sample_idx, source_parts = _get_gpt_sample_source_parts(
-        source_dataset, local_sample_idx
-    )
-    dataset_path = source_dataset.dataset_path
+        dataset_ids = np.asarray(dataset.dataset_index[sample_indices], dtype=np.int64)
+        local_sample_indices = np.asarray(dataset.dataset_sample_index[sample_indices], dtype=np.int64)
+        source_datasets = dataset.datasets
+    else:
+        dataset_ids = np.zeros(len(sample_indices), dtype=np.int64)
+        local_sample_indices = sample_indices
+        source_datasets = [dataset]
+
+    columns: Dict[str, np.ndarray] = {
+        "sample_idx": sample_indices,
+        "dataset_id": dataset_ids,
+    }
+    for key in [
+        "local_sample_idx",
+        "shuffled_sample_idx",
+        "doc_index_beg",
+        "doc_index_beg_offset",
+        "doc_index_end",
+        "doc_index_end_offset",
+        "sequence_id_beg",
+        "sequence_id_end",
+        "byte_offset_beg",
+        "num_source_sequences",
+    ]:
+        columns[key] = np.empty(len(sample_indices), dtype=np.int64)
+
+    datasets = []
+    for dataset_id in sorted(np.unique(dataset_ids).astype(np.int64).tolist()):
+        source_dataset = source_datasets[dataset_id]
+        dataset_path = source_dataset.dataset_path
+        datasets.append(
+            {
+                "dataset_id": dataset_id,
+                "dataset_path": dataset_path,
+                "bin_path": None if dataset_path is None else f"{dataset_path}.bin",
+                "idx_path": None if dataset_path is None else f"{dataset_path}.idx",
+            }
+        )
+
+        mask = dataset_ids == dataset_id
+        grouped_columns = _vectorized_gpt_sample_source_columns(
+            source_dataset, local_sample_indices[mask]
+        )
+        positions = np.nonzero(mask)[0]
+        for key, values in grouped_columns.items():
+            columns[key][positions] = values
+
+    return datasets, columns
+
+
+def _batch_source_record(
+    split_name: str,
+    batch_start: int,
+    batch_end: int,
+    batch_size: int,
+    batch_idx: int,
+    datasets: List[Dict[str, Any]],
+    columns: Dict[str, np.ndarray],
+    chunk_sample_start: int,
+) -> Dict[str, Any]:
+    """Build one JSON-safe batch record from precomputed chunk columns."""
+    local_start = batch_start - chunk_sample_start
+    local_end = batch_end - chunk_sample_start
 
     return {
         "split": split_name,
-        "sample_idx": sample_idx,
-        "dataset_id": blended_dataset_id,
-        "dataset_sample_idx": blended_sample_idx,
-        "local_sample_idx": int(local_sample_idx),
-        "shuffled_sample_idx": shuffled_sample_idx,
-        "dataset_path": dataset_path,
-        "bin_path": None if dataset_path is None else f"{dataset_path}.bin",
-        "idx_path": None if dataset_path is None else f"{dataset_path}.idx",
-        "source_parts": source_parts,
+        "batch_idx": batch_idx,
+        "global_batch_size": batch_size,
+        "sample_idx_begin": batch_start,
+        "sample_idx_end_exclusive": batch_end,
+        "datasets": datasets,
+        "columns": {
+            key: values[local_start:local_end].tolist() for key, values in columns.items()
+        },
     }
 
 
@@ -218,21 +269,36 @@ def _write_dataset_batch_map_records(writer: Any, dataset: Any, split_name: str,
         return total
 
     num_batches = 0
-    for batch_start in range(0, len(dataset), batch_size):
-        batch_end = min(batch_start + batch_size, len(dataset))
-        record = {
-            "split": split_name,
-            "batch_idx": num_batches,
-            "global_batch_size": batch_size,
-            "sample_idx_begin": batch_start,
-            "sample_idx_end_exclusive": batch_end,
-            "samples": [
-                _sample_source_record(dataset, split_name, sample_idx)
-                for sample_idx in range(batch_start, batch_end)
-            ],
-        }
-        writer.write(json.dumps(record) + "\n")
-        num_batches += 1
+    batches_per_chunk = 1024
+    samples_per_chunk = batch_size * batches_per_chunk
+
+    from tqdm import tqdm
+
+    total_batches = (len(dataset) + batch_size - 1) // batch_size
+    chunk_starts = range(0, len(dataset), samples_per_chunk)
+    for chunk_start in tqdm(chunk_starts, total=(len(dataset) + samples_per_chunk - 1) // samples_per_chunk):
+        chunk_end = min(chunk_start + samples_per_chunk, len(dataset))
+        datasets, columns = _source_columns_for_sample_range(dataset, chunk_start, chunk_end)
+
+        first_batch_in_chunk = chunk_start // batch_size
+        last_batch_in_chunk = (chunk_end + batch_size - 1) // batch_size
+        for batch_idx in range(first_batch_in_chunk, last_batch_in_chunk):
+            batch_start = batch_idx * batch_size
+            batch_end = min(batch_start + batch_size, len(dataset))
+            record = _batch_source_record(
+                split_name,
+                batch_start,
+                batch_end,
+                batch_size,
+                batch_idx,
+                datasets,
+                columns,
+                chunk_start,
+            )
+            writer.write(json.dumps(record) + "\n")
+            num_batches += 1
+
+    assert num_batches == total_batches
     return num_batches
 
 
