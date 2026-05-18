@@ -10,8 +10,10 @@ import argparse
 import json
 from typing import Any, Dict, List, Optional, Tuple
 import os
+import numpy as np
 import torch.distributed as dist
 
+from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.utils import compile_helpers
@@ -41,6 +43,18 @@ def add_prepare_cache_args(parser: argparse.ArgumentParser) -> argparse.Argument
         help=(
             "Optional override for the effective world size used to derive data-parallel size and "
             "dataset sample counts during cache preparation."
+        ),
+    )
+
+    group.add_argument(
+        "--prepare-cache-sample-map-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to write a JSONL file with one record per global batch/step. Each "
+            "record includes that batch's samples and their source dataset prefix, .bin/.idx "
+            "paths, blended dataset id, local sample index, shuffled sample index, source "
+            "sequence ids, token offsets, and byte offsets into the .bin file."
         ),
     )
     return parser
@@ -99,6 +113,156 @@ def _get_dataset_length(dataset: Optional[Any]) -> Optional[Any]:
     if isinstance(dataset, list):
         return [len(ds) if ds is not None else None for ds in dataset]
     return len(dataset)
+
+
+def _get_gpt_sample_source_parts(
+    dataset: GPTDataset, local_sample_idx: int
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """Map a GPTDataset sample index to its source sequences and .bin byte offsets."""
+    if dataset.shuffle_index is None:
+        dataset.shuffle_index = np.load(
+            dataset.path_to_shuffle_index, allow_pickle=True, mmap_mode="r"
+        )
+        dataset.sample_index = np.load(
+            dataset.path_to_sample_index, allow_pickle=True, mmap_mode="r"
+        )
+        dataset.document_index = np.load(
+            dataset.path_to_document_index, allow_pickle=True, mmap_mode="r"
+        )
+
+    shuffled_sample_idx = int(dataset.shuffle_index[local_sample_idx])
+    doc_index_beg, doc_index_beg_offset = dataset.sample_index[shuffled_sample_idx]
+    doc_index_end, doc_index_end_offset = dataset.sample_index[shuffled_sample_idx + 1]
+
+    source_parts: List[Dict[str, Any]] = []
+    low_level_dataset = dataset.dataset
+    dtype_size = int(low_level_dataset.index.dtype_size)
+
+    for doc_index in range(int(doc_index_beg), int(doc_index_end) + 1):
+        sequence_id = int(dataset.document_index[doc_index])
+        token_offset = int(doc_index_beg_offset) if doc_index == int(doc_index_beg) else 0
+        if doc_index == int(doc_index_end):
+            token_length = (
+                int(doc_index_end_offset)
+                - token_offset
+                + int(dataset.config.add_extra_token_to_sequence)
+            )
+        else:
+            token_length = int(low_level_dataset.sequence_lengths[sequence_id]) - token_offset
+        sequence_pointer = int(low_level_dataset.index.sequence_pointers[sequence_id])
+        byte_offset = sequence_pointer + token_offset * dtype_size
+
+        source_parts.append(
+            {
+                "sequence_id": sequence_id,
+                "document_index_position": doc_index,
+                "token_offset": token_offset,
+                "token_length": token_length,
+                "byte_offset": byte_offset,
+                "byte_length": token_length * dtype_size,
+                "sequence_pointer": sequence_pointer,
+                "sequence_length": int(low_level_dataset.sequence_lengths[sequence_id]),
+            }
+        )
+
+    return shuffled_sample_idx, source_parts
+
+
+def _sample_source_record(dataset: Any, split_name: str, sample_idx: int) -> Dict[str, Any]:
+    """Build one JSON-safe source mapping record for a top-level dataset sample."""
+    blended_dataset_id = None
+    blended_sample_idx = None
+    source_dataset = dataset
+    local_sample_idx = sample_idx
+
+    if isinstance(dataset, BlendedDataset):
+        if dataset.dataset_index is None:
+            dataset.dataset_index = np.load(
+                dataset.path_to_dataset_index, allow_pickle=True, mmap_mode="r"
+            )
+            dataset.dataset_sample_index = np.load(
+                dataset.path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
+            )
+        blended_dataset_id = int(dataset.dataset_index[sample_idx])
+        blended_sample_idx = int(dataset.dataset_sample_index[sample_idx])
+        source_dataset = dataset.datasets[blended_dataset_id]
+        local_sample_idx = blended_sample_idx
+
+    shuffled_sample_idx, source_parts = _get_gpt_sample_source_parts(
+        source_dataset, local_sample_idx
+    )
+    dataset_path = source_dataset.dataset_path
+
+    return {
+        "split": split_name,
+        "sample_idx": sample_idx,
+        "dataset_id": blended_dataset_id,
+        "dataset_sample_idx": blended_sample_idx,
+        "local_sample_idx": int(local_sample_idx),
+        "shuffled_sample_idx": shuffled_sample_idx,
+        "dataset_path": dataset_path,
+        "bin_path": None if dataset_path is None else f"{dataset_path}.bin",
+        "idx_path": None if dataset_path is None else f"{dataset_path}.idx",
+        "source_parts": source_parts,
+    }
+
+
+def _write_dataset_batch_map_records(writer: Any, dataset: Any, split_name: str, batch_size: int) -> int:
+    """Write JSONL records that map each global batch to source samples."""
+    if dataset is None:
+        return 0
+    if isinstance(dataset, list):
+        total = 0
+        for i, child in enumerate(dataset):
+            total += _write_dataset_batch_map_records(writer, child, f"{split_name}_{i}", batch_size)
+        return total
+
+    num_batches = 0
+    for batch_start in range(0, len(dataset), batch_size):
+        batch_end = min(batch_start + batch_size, len(dataset))
+        record = {
+            "split": split_name,
+            "batch_idx": num_batches,
+            "global_batch_size": batch_size,
+            "sample_idx_begin": batch_start,
+            "sample_idx_end_exclusive": batch_end,
+            "samples": [
+                _sample_source_record(dataset, split_name, sample_idx)
+                for sample_idx in range(batch_start, batch_end)
+            ],
+        }
+        writer.write(json.dumps(record) + "\n")
+        num_batches += 1
+    return num_batches
+
+
+def _write_prepare_cache_batch_map(
+    path: str,
+    args: Any,
+    train_ds: Optional[Any],
+    valid_ds: Optional[Any],
+    test_ds: Optional[Any],
+) -> None:
+    """Write a JSONL file mapping each global batch to source data locations."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as writer:
+        train_batches = _write_dataset_batch_map_records(
+            writer, train_ds, "train", args.global_batch_size
+        )
+        valid_batches = _write_dataset_batch_map_records(
+            writer, valid_ds, "validation", args.global_batch_size
+        )
+        test_batches = _write_dataset_batch_map_records(
+            writer, test_ds, "test", args.global_batch_size
+        )
+    print(
+        f"> wrote dataset batch source map to {path} "
+        f"(train batches: {train_batches}, validation batches: {valid_batches}, "
+        f"test batches: {test_batches})"
+    )
 
 
 def _print_effective_configuration(
@@ -198,6 +362,15 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
         print(f"  validation dataset length: {_get_dataset_length(valid_ds)}")
         print(f"  test dataset length:       {_get_dataset_length(test_ds)}")
 
+        if args.prepare_cache_sample_map_path is not None:
+            _write_prepare_cache_batch_map(
+                args.prepare_cache_sample_map_path,
+                args,
+                train_ds,
+                valid_ds,
+                test_ds,
+            )
+
         return {
             "world_size": args.world_size,
             "data_parallel_size": args.data_parallel_size,
@@ -206,6 +379,7 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
             "train_dataset_length": _get_dataset_length(train_ds),
             "valid_dataset_length": _get_dataset_length(valid_ds),
             "test_dataset_length": _get_dataset_length(test_ds),
+            "sample_map_path": args.prepare_cache_sample_map_path,
         }
     finally:
         unset_global_variables()
