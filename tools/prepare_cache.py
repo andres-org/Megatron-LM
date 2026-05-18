@@ -10,7 +10,6 @@ import argparse
 import json
 from typing import Any, Dict, List, Optional, Tuple
 import os
-import numpy as np
 import torch.distributed as dist
 
 from megatron.core.datasets.blended_dataset import BlendedDataset
@@ -47,16 +46,16 @@ def add_prepare_cache_args(parser: argparse.ArgumentParser) -> argparse.Argument
     )
 
     group.add_argument(
-        "--prepare-cache-sample-map-path",
+        "--prepare-cache-manifest-path",
         type=str,
         default=None,
         help=(
-            "Optional path to write a JSONL file with one record per global batch/step. Each "
-            "record includes that batch's samples and their source dataset prefix, .bin/.idx "
-            "paths, blended dataset id, local sample index, shuffled sample index, source "
-            "sequence ids, token offsets, and byte offsets into the .bin file."
+            "Optional path to write a small JSON manifest describing the generated dataset cache. "
+            "The manifest records the cache .npy files and source .bin/.idx prefixes needed by "
+            "a query tool to resolve arbitrary training batches."
         ),
     )
+
     return parser
 
 
@@ -115,220 +114,132 @@ def _get_dataset_length(dataset: Optional[Any]) -> Optional[Any]:
     return len(dataset)
 
 
-def _ensure_gpt_indices_loaded(dataset: GPTDataset) -> None:
-    """Lazy-load GPTDataset cache indices needed for sample source mapping."""
-    if dataset.shuffle_index is None:
-        dataset.shuffle_index = np.load(
-            dataset.path_to_shuffle_index, allow_pickle=True, mmap_mode="r"
-        )
-        dataset.sample_index = np.load(
-            dataset.path_to_sample_index, allow_pickle=True, mmap_mode="r"
-        )
-        dataset.document_index = np.load(
-            dataset.path_to_document_index, allow_pickle=True, mmap_mode="r"
-        )
+def _cache_file_path(dataset: Any, suffix: str) -> Optional[str]:
+    """Return the standard cache path for a built BlendedDataset or GPTDataset index file."""
+    path_to_cache = getattr(getattr(dataset, "config", None), "path_to_cache", None)
+    if path_to_cache is None:
+        return None
+
+    split = getattr(dataset, "split", None)
+    if split is None:
+        split = getattr(dataset, "index_split", None)
+    split_name = getattr(split, "name", None)
+    if split_name is None:
+        return None
+
+    return os.path.join(
+        path_to_cache,
+        f"{dataset.unique_description_hash}-{type(dataset).__name__}-{split_name}-{suffix}",
+    )
 
 
-def _vectorized_gpt_sample_source_columns(
-    dataset: GPTDataset, local_sample_indices: np.ndarray
-) -> Dict[str, np.ndarray]:
-    """Map GPTDataset sample indices to compact, array-oriented source columns."""
-    _ensure_gpt_indices_loaded(dataset)
-
-    shuffled_sample_indices = np.asarray(dataset.shuffle_index[local_sample_indices], dtype=np.int64)
-    sample_starts = dataset.sample_index[shuffled_sample_indices]
-    sample_ends = dataset.sample_index[shuffled_sample_indices + 1]
-
-    doc_index_beg = np.asarray(sample_starts[:, 0], dtype=np.int64)
-    doc_index_beg_offset = np.asarray(sample_starts[:, 1], dtype=np.int64)
-    doc_index_end = np.asarray(sample_ends[:, 0], dtype=np.int64)
-    doc_index_end_offset = np.asarray(sample_ends[:, 1], dtype=np.int64)
-
-    sequence_id_beg = np.asarray(dataset.document_index[doc_index_beg], dtype=np.int64)
-    sequence_id_end = np.asarray(dataset.document_index[doc_index_end], dtype=np.int64)
-
+def _manifest_for_gpt_dataset(dataset: GPTDataset, dataset_id: Optional[int] = None) -> Dict[str, Any]:
+    """Return manifest metadata for one source GPTDataset."""
     low_level_dataset = dataset.dataset
-    dtype_size = int(low_level_dataset.index.dtype_size)
-    sequence_pointer_beg = low_level_dataset.index.sequence_pointers[sequence_id_beg]
-    byte_offset_beg = np.asarray(sequence_pointer_beg + doc_index_beg_offset * dtype_size, dtype=np.int64)
+    source_path = low_level_dataset.path_prefix
+    index = low_level_dataset.index
+    index_mmap = index.bin_buffer_mmap
+    actual_idx_path = os.path.realpath(index_mmap.filename)
+    actual_bin_path = os.path.realpath(f"{source_path}.bin")
+    actual_source_path = actual_bin_path[: -len(".bin")]
 
-    return {
-        "local_sample_idx": local_sample_indices.astype(np.int64),
-        "shuffled_sample_idx": shuffled_sample_indices,
-        "doc_index_beg": doc_index_beg,
-        "doc_index_beg_offset": doc_index_beg_offset,
-        "doc_index_end": doc_index_end,
-        "doc_index_end_offset": doc_index_end_offset,
-        "sequence_id_beg": sequence_id_beg,
-        "sequence_id_end": sequence_id_end,
-        "byte_offset_beg": byte_offset_beg,
-        "num_source_sequences": doc_index_end - doc_index_beg + 1,
-    }
-
-
-def _source_columns_for_sample_range(
-    dataset: Any, sample_start: int, sample_end: int
-) -> Tuple[List[Dict[str, Any]], Dict[str, np.ndarray]]:
-    """Build source mapping columns for a contiguous range of global samples."""
-    sample_indices = np.arange(sample_start, sample_end, dtype=np.int64)
-
-    if isinstance(dataset, BlendedDataset):
-        if dataset.dataset_index is None:
-            dataset.dataset_index = np.load(
-                dataset.path_to_dataset_index, allow_pickle=True, mmap_mode="r"
-            )
-            dataset.dataset_sample_index = np.load(
-                dataset.path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
-            )
-
-        dataset_ids = np.asarray(dataset.dataset_index[sample_indices], dtype=np.int64)
-        local_sample_indices = np.asarray(dataset.dataset_sample_index[sample_indices], dtype=np.int64)
-        source_datasets = dataset.datasets
-    else:
-        dataset_ids = np.zeros(len(sample_indices), dtype=np.int64)
-        local_sample_indices = sample_indices
-        source_datasets = [dataset]
-
-    columns: Dict[str, np.ndarray] = {
-        "sample_idx": sample_indices,
-        "dataset_id": dataset_ids,
-    }
-    for key in [
-        "local_sample_idx",
-        "shuffled_sample_idx",
-        "doc_index_beg",
-        "doc_index_beg_offset",
-        "doc_index_end",
-        "doc_index_end_offset",
-        "sequence_id_beg",
-        "sequence_id_end",
-        "byte_offset_beg",
-        "num_source_sequences",
-    ]:
-        columns[key] = np.empty(len(sample_indices), dtype=np.int64)
-
-    datasets = []
-    for dataset_id in sorted(np.unique(dataset_ids).astype(np.int64).tolist()):
-        source_dataset = source_datasets[dataset_id]
-        dataset_path = source_dataset.dataset_path
-        datasets.append(
-            {
-                "dataset_id": dataset_id,
-                "dataset_path": dataset_path,
-                "bin_path": None if dataset_path is None else f"{dataset_path}.bin",
-                "idx_path": None if dataset_path is None else f"{dataset_path}.idx",
-            }
-        )
-
-        mask = dataset_ids == dataset_id
-        grouped_columns = _vectorized_gpt_sample_source_columns(
-            source_dataset, local_sample_indices[mask]
-        )
-        positions = np.nonzero(mask)[0]
-        for key, values in grouped_columns.items():
-            columns[key][positions] = values
-
-    return datasets, columns
-
-
-def _batch_source_record(
-    split_name: str,
-    batch_start: int,
-    batch_end: int,
-    batch_size: int,
-    batch_idx: int,
-    datasets: List[Dict[str, Any]],
-    columns: Dict[str, np.ndarray],
-    chunk_sample_start: int,
-) -> Dict[str, Any]:
-    """Build one JSON-safe batch record from precomputed chunk columns."""
-    local_start = batch_start - chunk_sample_start
-    local_end = batch_end - chunk_sample_start
-
-    return {
-        "split": split_name,
-        "batch_idx": batch_idx,
-        "global_batch_size": batch_size,
-        "sample_idx_begin": batch_start,
-        "sample_idx_end_exclusive": batch_end,
-        "datasets": datasets,
-        "columns": {
-            key: values[local_start:local_end].tolist() for key, values in columns.items()
+    entry = {
+        "type": type(dataset).__name__,
+        "dataset_id": dataset_id,
+        "split": dataset.index_split.name,
+        "length": len(dataset),
+        "num_samples": dataset.num_samples,
+        "dataset_path": actual_source_path,
+        "bin_path": actual_bin_path,
+        "idx_path": actual_idx_path,
+        "cache": {
+            "description": _cache_file_path(dataset, "description.txt"),
+            "document_index": _cache_file_path(dataset, "document_index.npy"),
+            "sample_index": _cache_file_path(dataset, "sample_index.npy"),
+            "shuffle_index": _cache_file_path(dataset, "shuffle_index.npy"),
         },
     }
 
+    entry["indexed_dataset"] = {
+        "path_prefix": actual_source_path,
+        "idx_path": actual_idx_path,
+        "dtype": str(index.dtype),
+        "dtype_size": index.dtype_size,
+        "sequence_count": index.sequence_count,
+        "document_count": index.document_count,
+    }
 
-def _write_dataset_batch_map_records(writer: Any, dataset: Any, split_name: str, batch_size: int) -> int:
-    """Write JSONL records that map each global batch to source samples."""
+    return entry
+
+
+def _manifest_for_dataset(dataset: Optional[Any]) -> Optional[Any]:
+    """Return manifest metadata for a train/validation/test dataset object."""
     if dataset is None:
-        return 0
+        return None
     if isinstance(dataset, list):
-        total = 0
-        for i, child in enumerate(dataset):
-            total += _write_dataset_batch_map_records(writer, child, f"{split_name}_{i}", batch_size)
-        return total
+        return [_manifest_for_dataset(child) for child in dataset]
+    if isinstance(dataset, BlendedDataset):
+        return {
+            "type": type(dataset).__name__,
+            "split": dataset.split.name,
+            "length": len(dataset),
+            "size": dataset.size,
+            "cache": {
+                "description": _cache_file_path(dataset, "description.txt"),
+                "dataset_index": _cache_file_path(dataset, "dataset_index.npy"),
+                "dataset_sample_index": _cache_file_path(dataset, "dataset_sample_index.npy"),
+            },
+            "datasets": [
+                _manifest_for_gpt_dataset(child, dataset_id)
+                for dataset_id, child in enumerate(dataset.datasets)
+            ],
+        }
+    if isinstance(dataset, GPTDataset):
+        return _manifest_for_gpt_dataset(dataset, 0)
 
-    num_batches = 0
-    batches_per_chunk = 1024
-    samples_per_chunk = batch_size * batches_per_chunk
-
-    from tqdm import tqdm
-
-    total_batches = (len(dataset) + batch_size - 1) // batch_size
-    chunk_starts = range(0, len(dataset), samples_per_chunk)
-    for chunk_start in tqdm(chunk_starts, total=(len(dataset) + samples_per_chunk - 1) // samples_per_chunk):
-        chunk_end = min(chunk_start + samples_per_chunk, len(dataset))
-        datasets, columns = _source_columns_for_sample_range(dataset, chunk_start, chunk_end)
-
-        first_batch_in_chunk = chunk_start // batch_size
-        last_batch_in_chunk = (chunk_end + batch_size - 1) // batch_size
-        for batch_idx in range(first_batch_in_chunk, last_batch_in_chunk):
-            batch_start = batch_idx * batch_size
-            batch_end = min(batch_start + batch_size, len(dataset))
-            record = _batch_source_record(
-                split_name,
-                batch_start,
-                batch_end,
-                batch_size,
-                batch_idx,
-                datasets,
-                columns,
-                chunk_start,
-            )
-            writer.write(json.dumps(record) + "\n")
-            num_batches += 1
-
-    assert num_batches == total_batches
-    return num_batches
+    return {
+        "type": type(dataset).__name__,
+        "length": len(dataset),
+    }
 
 
-def _write_prepare_cache_batch_map(
+def _write_prepare_cache_manifest(
     path: str,
     args: Any,
+    train_valid_test_num_samples: Any,
     train_ds: Optional[Any],
     valid_ds: Optional[Any],
     test_ds: Optional[Any],
-) -> None:
-    """Write a JSONL file mapping each global batch to source data locations."""
+) -> Dict[str, Any]:
+    """Write a small JSON manifest pointing at the generated Megatron dataset cache files."""
+    manifest = {
+        "format": "megatron_dataset_cache_manifest_v1",
+        "world_size": args.world_size,
+        "data_parallel_size": args.data_parallel_size,
+        "global_batch_size": args.global_batch_size,
+        "micro_batch_size": args.micro_batch_size,
+        "train_iters": args.train_iters,
+        "train_samples": args.train_samples,
+        "seed": args.seed,
+        "seq_length": args.seq_length,
+        "split": args.split,
+        "data_cache_path": args.data_cache_path,
+        "train_valid_test_num_samples": list(train_valid_test_num_samples),
+        "splits": {
+            "train": _manifest_for_dataset(train_ds),
+            "validation": _manifest_for_dataset(valid_ds),
+            "test": _manifest_for_dataset(test_ds),
+        },
+    }
+
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-
     with open(path, "w", encoding="utf-8") as writer:
-        train_batches = _write_dataset_batch_map_records(
-            writer, train_ds, "train", args.global_batch_size
-        )
-        valid_batches = _write_dataset_batch_map_records(
-            writer, valid_ds, "validation", args.global_batch_size
-        )
-        test_batches = _write_dataset_batch_map_records(
-            writer, test_ds, "test", args.global_batch_size
-        )
-    print(
-        f"> wrote dataset batch source map to {path} "
-        f"(train batches: {train_batches}, validation batches: {valid_batches}, "
-        f"test batches: {test_batches})"
-    )
+        json.dump(manifest, writer, indent=2, sort_keys=True)
+        writer.write("\n")
+    print(f"> wrote dataset cache manifest to {path}")
+    return manifest
 
 
 def _print_effective_configuration(
@@ -428,10 +339,12 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
         print(f"  validation dataset length: {_get_dataset_length(valid_ds)}")
         print(f"  test dataset length:       {_get_dataset_length(test_ds)}")
 
-        if args.prepare_cache_sample_map_path is not None:
-            _write_prepare_cache_batch_map(
-                args.prepare_cache_sample_map_path,
+        manifest = None
+        if args.prepare_cache_manifest_path is not None:
+            manifest = _write_prepare_cache_manifest(
+                args.prepare_cache_manifest_path,
                 args,
+                train_valid_test_num_samples,
                 train_ds,
                 valid_ds,
                 test_ds,
@@ -445,7 +358,8 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
             "train_dataset_length": _get_dataset_length(train_ds),
             "valid_dataset_length": _get_dataset_length(valid_ds),
             "test_dataset_length": _get_dataset_length(test_ds),
-            "sample_map_path": args.prepare_cache_sample_map_path,
+            "manifest_path": args.prepare_cache_manifest_path,
+            "manifest": manifest,
         }
     finally:
         unset_global_variables()
