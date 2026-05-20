@@ -160,6 +160,75 @@ class TestParallelAttentionWithPackedSequence:
 
         torch.testing.assert_close(output_multi, output_ref, atol=1e-3, rtol=1e-3)
 
+    def test_gpu_forward_thd_no_cross_doc_attention(self):
+        """Changing an earlier packed document must not affect later packed documents."""
+
+        deterministic_config = deepcopy(self.transformer_config)
+        deterministic_config.attention_dropout = 0.0
+        self.parallel_attention = SelfAttention(
+            deterministic_config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        self.parallel_attention.cuda()
+        self.parallel_attention.eval()
+        config = self.parallel_attention.config
+
+        sequence_length = 32
+        micro_batch_size = 2
+        first_doc_end = 6
+
+        torch.manual_seed(1234)
+        hidden_states = torch.randn(
+            sequence_length,
+            micro_batch_size,
+            config.hidden_size,
+            dtype=torch.bfloat16,
+            device='cuda',
+        )
+
+        single_cu = torch.IntTensor([0, first_doc_end, 19, 22, sequence_length]).cuda()
+        merged_cu = torch.cat([single_cu, single_cu[1:] + sequence_length])
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=merged_cu,
+            cu_seqlens_kv=merged_cu,
+            max_seqlen_q=torch.diff(merged_cu).max().item(),
+            max_seqlen_kv=torch.diff(merged_cu).max().item(),
+            qkv_format='thd',
+        )
+
+        with torch.no_grad():
+            output_before, _ = self.parallel_attention(
+                hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+            )
+
+            mutated_hidden_states = hidden_states.clone()
+            mutated_hidden_states[:first_doc_end, 0, :] = torch.randn_like(
+                mutated_hidden_states[:first_doc_end, 0, :]
+            ) * 10
+            output_after, _ = self.parallel_attention(
+                mutated_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+            )
+
+        # The mutated document itself should change, otherwise the test would be vacuous.
+        assert not torch.allclose(
+            output_before[:first_doc_end, 0, :], output_after[:first_doc_end, 0, :]
+        )
+
+        # Later documents in the same sample must not attend to the mutated earlier document.
+        torch.testing.assert_close(
+            output_before[first_doc_end:, 0, :],
+            output_after[first_doc_end:, 0, :],
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+        # Other batch elements must also remain independent after the THD flatten/unflatten path.
+        torch.testing.assert_close(
+            output_before[:, 1, :], output_after[:, 1, :], atol=1e-3, rtol=1e-3
+        )
+
     def test_gpu_forward(self):
 
         config = self.parallel_attention.config
