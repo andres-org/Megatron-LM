@@ -34,6 +34,48 @@ class _DeterministicLowLevelDataset:
         return 1
 
 
+class _LoadedPathLowLevelDataset:
+    def __init__(self, documents):
+        self.documents = [numpy.array(document, dtype=numpy.int64) for document in documents]
+        self.sequence_lengths = numpy.array(
+            [document.shape[0] for document in self.documents], dtype=numpy.int32
+        )
+        self.get_calls = []
+
+    def __len__(self):
+        return len(self.documents)
+
+    def get(self, idx, offset=0, length=None):
+        self.get_calls.append((idx, offset, length))
+        document = self.documents[idx]
+        if length is None:
+            return document[offset:].copy()
+        return document[offset : offset + length].copy()
+
+
+class _LoadedPathGPTDataset(GPTDataset):
+    def __init__(self, low_level_dataset, config):
+        super().__init__(
+            low_level_dataset,
+            None,
+            numpy.arange(len(low_level_dataset), dtype=numpy.int64),
+            1,
+            Split.train,
+            config,
+        )
+
+    @staticmethod
+    def build_low_level_dataset(dataset_path, config):
+        raise NotImplementedError
+
+    def _build_document_sample_shuffle_indices(self):
+        return (
+            numpy.array([0, 1, 2], dtype=numpy.int64),
+            numpy.array([[0, 0], [2, 3]], dtype=numpy.int64),
+            numpy.array([0], dtype=numpy.uint32),
+        )
+
+
 class _DeterministicGPTDataset(GPTDataset):
     def __init__(self, sample, config):
         self._sample = numpy.array(sample, dtype=numpy.int64)
@@ -165,6 +207,7 @@ def test_gpt_dataset_cu_seqlens_from_eod_boundaries(create_attention_mask):
         eod_mask_loss=False,
         create_attention_mask=create_attention_mask,
         add_extra_token_to_sequence=False,
+        use_packed_seq_params=True,
         tokenizer=tokenizer,
     )
 
@@ -182,6 +225,48 @@ def test_gpt_dataset_cu_seqlens_from_eod_boundaries(create_attention_mask):
         assert "attention_mask" not in item
 
 
+def test_gpt_dataset_cu_seqlens_created_after_loading_multiple_documents():
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+
+    config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=10,
+        split="1,0,0",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=False,
+        add_extra_token_to_sequence=False,
+        use_packed_seq_params=True,
+        tokenizer=tokenizer,
+    )
+
+    low_level_dataset = _LoadedPathLowLevelDataset(
+        [
+            [10, 11, tokenizer.eod],
+            [20, 21, 22, tokenizer.eod],
+            [30, 31, tokenizer.eod],
+        ]
+    )
+    dataset = _LoadedPathGPTDataset(low_level_dataset, config)
+
+    item = dataset[0]
+
+    assert torch.equal(
+        item["tokens"],
+        torch.tensor(
+            [10, 11, tokenizer.eod, 20, 21, 22, tokenizer.eod, 30, 31, tokenizer.eod],
+            dtype=torch.int64,
+        ),
+    )
+    assert torch.equal(item["cu_seqlens"], torch.tensor([0, 3, 7, 10], dtype=torch.int32))
+    assert item["max_seqlen"].dtype == torch.int32
+    assert item["max_seqlen"].item() == 4
+    assert low_level_dataset.get_calls == [(0, 0, None), (1, 0, None), (2, 0, 3)]
+
+
 def test_gpt_dataset_cu_seqlens_without_eod():
     tokenizer = MegatronTokenizer.from_pretrained(
         metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
@@ -196,6 +281,7 @@ def test_gpt_dataset_cu_seqlens_without_eod():
         eod_mask_loss=False,
         create_attention_mask=False,
         add_extra_token_to_sequence=False,
+        use_packed_seq_params=True,
         tokenizer=tokenizer,
     )
 
