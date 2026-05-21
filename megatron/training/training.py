@@ -2197,6 +2197,13 @@ def training_log(
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
+        tokens_per_iteration = batch_size * args.seq_length
+        tokens_per_sec_per_gpu = tokens_per_iteration / (
+            elapsed_time_per_iteration * args.world_size
+        )
+        iterations_remaining = max(args.train_iters - iteration, 0)
+        eta_seconds = iterations_remaining * elapsed_time_per_iteration
+        eta = str(timedelta(seconds=int(eta_seconds)))
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -2211,6 +2218,8 @@ def training_log(
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
+        consumed_tokens = args.consumed_train_samples * args.seq_length / 1e9
+        log_string += ' consumed tokens: {:.3f}B |'.format(consumed_tokens)
         if has_rl_utils and args.rl_use_sequence_packing:
             log_string += rl_utils.get_sequence_packing_log_info(args)
         if args.skipped_train_samples > 0:
@@ -2218,6 +2227,20 @@ def training_log(
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0
         )
+        log_string += f' eta: {eta} |'
+        log_string += f' tokens/sec/gpu: {tokens_per_sec_per_gpu:.1f} |'
+        if args.log_timers_to_tensorboard and not is_first_iteration:
+            if writer:
+                writer.add_scalar('tokens-per-sec-per-GPU', tokens_per_sec_per_gpu, iteration)
+                writer.add_scalar('eta-seconds', eta_seconds, iteration)
+            if wandb_writer:
+                wandb_writer.log(
+                    {
+                        'tokens-per-sec-per-GPU': tokens_per_sec_per_gpu,
+                        'eta-seconds': eta_seconds,
+                    },
+                    iteration,
+                )
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             if args.log_timers_to_tensorboard:
