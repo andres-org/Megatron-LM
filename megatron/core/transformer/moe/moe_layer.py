@@ -1276,7 +1276,7 @@ class SonicMoELayer(BaseMoELayer):
             hidden_states, metadata, _ = self.token_dispatcher.dispatch_postprocess(
                 hidden_states, probs
             )
-            router_scores = metadata.router_probs.reshape(-1)
+            router_scores = probs.reshape(-1)
             token_indices = metadata.token_indices.reshape(-1)
             expert_indices = metadata.expert_indices.reshape(-1)
             valid_mask = expert_indices >= 0

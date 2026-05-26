@@ -3,6 +3,7 @@ from contextlib import nullcontext
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
@@ -13,6 +14,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     DummyState,
@@ -25,6 +27,15 @@ from tests.unit_tests.a2a_overlap.utils import (
     reset_model,
 )
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    from megatron.core.transformer.moe.sonicmoe_util import sonicmoe_is_available
+
+    HAVE_SONICMOE = sonicmoe_is_available()
+except Exception:
+    HAVE_SONICMOE = False
+
+DEVICE_CAPABILITY = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
 
 
 def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
@@ -293,6 +304,7 @@ class TestA2AOverlap:
             comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
 
+
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     def test_transformer_layer_overlap_shared_expert(self):
         """
@@ -534,4 +546,83 @@ class TestA2AOverlap:
                 microbatches=microbatches,
             )
             comp_res = compare_captures(capture_ref, capture_a2a_overlap, True, True)
+            assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
+
+
+class TestSonicMoEA2AOverlap:
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=2,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_SONICMOE,
+        reason="CUDA or SonicMoE not available",
+    )
+    @pytest.mark.skipif(
+        not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 9,
+        reason="SonicMoE requires Hopper GPUs",
+    )
+    def test_transformer_layer_overlap_sonicmoe(self):
+        config = TransformerConfig(
+            num_layers=1,
+            attention_backend="unfused",
+            hidden_size=128,
+            num_attention_heads=4,
+            ffn_hidden_size=256,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=256,
+            expert_model_parallel_size=2,
+            deterministic_mode=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            moe_router_topk=2,
+            moe_router_dtype="fp32",
+            moe_use_sonicmoe=True,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="deepep",
+            overlap_moe_expert_parallel_comm=True,
+        )
+        microbatches = 2
+        with deterministic_mode():
+            transformer_layer_spec = get_gpt_decoder_block_spec(
+                config=config, use_transformer_engine=False
+            )
+            gpt_model = GPTModel(
+                config=config,
+                transformer_layer_spec=transformer_layer_spec,
+                vocab_size=100,
+                pre_process=True,
+                post_process=True,
+                max_sequence_length=128,
+            )
+            gpt_model.cuda().bfloat16()
+
+            params = reset_model(gpt_model)
+            input_tensors = [
+                torch.randn(64, 1, 128, dtype=torch.bfloat16, device="cuda") * 100
+                for _ in range(microbatches)
+            ]
+            for tensor in input_tensors:
+                tensor.requires_grad = True
+
+            capture_ref = run_transformer_layer_ref_with_capture(
+                gpt_model, input_tensors, microbatches
+            )
+            reset_model(gpt_model, params)
+            capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
+                gpt_model, input_tensors, microbatches
+            )
+            comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"

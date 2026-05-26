@@ -500,9 +500,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
-                local_tokens, probs = layer.mlp.preprocess(
+                preprocess_output = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )
+                if is_sonic_moe:
+                    local_tokens, probs, routing_map = preprocess_output
+                    node.layer_state.routing_map = routing_map
+                else:
+                    local_tokens, probs = preprocess_output
                 return hidden_states, local_tokens, probs, shared_expert_output
 
         hidden_states, local_tokens, probs, shared_expert_output = forward_func(
@@ -532,7 +537,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
-        if (enable_deepep or enable_hybridep) and not is_sonic_moe:
+        if enable_deepep or enable_hybridep:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
@@ -542,22 +547,35 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # `dispatched_probs` is needed by backward pass of swiglu, therefore it's
         # passed to moe_forward within `layer_state` to avoid the free_input process
         # of the input tensors.
+        if is_sonic_moe:
+            return dispatched_tokens, dispatched_probs
         node.layer_state.dispatched_probs = node.detach(dispatched_probs)
         return dispatched_tokens
 
-    def submodule_moe_forward(node: ScheduleNode, dispatched_tokens: torch.Tensor):
+    def submodule_moe_forward(
+        node: ScheduleNode,
+        dispatched_tokens: torch.Tensor,
+        dispatched_probs: Optional[torch.Tensor] = None,
+    ):
         """
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
         """
-        dispatched_probs = node.layer_state.dispatched_probs
+        if dispatched_probs is None:
+            dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
         if (enable_deepep or enable_hybridep) and not is_sonic_moe:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
-        expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
+        routing_map = getattr(node.layer_state, 'routing_map', None)
+        if is_sonic_moe:
+            expert_output, _ = layer.mlp.routed_experts_compute(
+                dispatched_tokens, dispatched_probs, routing_map
+            )
+        else:
+            expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
 
         # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
         # `routed_experts_compute`, a ref is needed to prevent it from being freed.
@@ -569,6 +587,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
+        node.layer_state.routing_map = None
 
         return expert_output
 
