@@ -183,6 +183,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
     mla_down_proj_fusion: bool = False,
+    moe_use_sonicmoe: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -231,6 +232,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
         moe_grouped_gemm=moe_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
+        moe_use_sonicmoe=moe_use_sonicmoe,
     )
 
     if multi_latent_attention:
@@ -359,6 +361,7 @@ def get_gpt_layer_local_submodules(
     use_kitchen: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    moe_use_sonicmoe: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for an implementation using only modules in Megatron-Core.
 
@@ -399,7 +402,10 @@ def get_gpt_layer_local_submodules(
         )
 
     mlp = get_mlp_module_spec_for_backend(
-        backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
+        backend=backend,
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+        moe_use_sonicmoe=moe_use_sonicmoe,
     )
 
     if multi_latent_attention:
@@ -516,6 +522,7 @@ def get_mlp_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
+    moe_use_sonicmoe: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
 
@@ -543,6 +550,7 @@ def get_mlp_module_spec_for_backend(
             num_experts=num_experts,
             moe_grouped_gemm=moe_grouped_gemm,
             use_te_activation_func=use_te_activation_func,
+            moe_use_sonicmoe=moe_use_sonicmoe,
         )
 
 
@@ -568,6 +576,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            moe_use_sonicmoe=config.moe_use_sonicmoe,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -580,6 +589,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            moe_use_sonicmoe=config.moe_use_sonicmoe,
         )
     elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
@@ -608,6 +618,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            moe_use_sonicmoe=config.moe_use_sonicmoe,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -619,6 +630,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            moe_use_sonicmoe=config.moe_use_sonicmoe,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.

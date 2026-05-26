@@ -2,6 +2,7 @@
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -48,6 +49,16 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 """
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SonicMoEFlexDispatchMetadata:
+    """Routing metadata for SonicMoE expert compute after flex dispatch."""
+
+    router_probs: torch.Tensor
+    token_indices: torch.Tensor
+    expert_indices: torch.Tensor
+    tokens_per_expert: torch.Tensor
 
 
 class MoETokenDispatcher:
@@ -1236,6 +1247,20 @@ class _DeepepManager(_DispatchManager):
         """
         return self.tokens_per_expert
 
+    def get_sonicmoe_metadata(self) -> SonicMoEFlexDispatchMetadata:
+        if self.config.moe_router_padding_for_quantization:
+            raise ValueError("SonicMoE flex dispatch does not support router padding.")
+        token_indices = torch.arange(
+            self.dispatched_indices.shape[0], device=self.dispatched_indices.device
+        ).unsqueeze(1)
+        token_indices = token_indices.expand_as(self.dispatched_indices)
+        return SonicMoEFlexDispatchMetadata(
+            router_probs=self.dispatched_probs,
+            token_indices=token_indices,
+            expert_indices=self.dispatched_indices,
+            tokens_per_expert=self.tokens_per_expert,
+        )
+
     def combine(
         self,
         hidden_states: torch.Tensor,
@@ -1381,6 +1406,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 "Please set --moe-flex-dispatcher-backend=deepep or "
                 "--moe-flex-dispatcher-backend=hybridep"
             )
+        self.skip_permutation_for_sonicmoe = (
+            self.config.moe_use_sonicmoe
+            and self.config.moe_flex_dispatcher_backend == "deepep"
+        )
 
     def set_shared_experts(self, shared_experts):
         raise NotImplementedError(
@@ -1483,6 +1512,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of permuted tokens, token counts per expert, and permuted probabilities.
         """
+        if self.skip_permutation_for_sonicmoe:
+            if not hasattr(self._comm_manager, "get_sonicmoe_metadata"):
+                raise ValueError("SonicMoE flex dispatch currently requires the DeepEP backend.")
+            metadata = self._comm_manager.get_sonicmoe_metadata()
+            return hidden_states, metadata, metadata.router_probs
+
         global_input_tokens, permuted_probs = (
             self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
         )
@@ -1495,6 +1530,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         This method restores the hidden states to their original ordering before expert processing
         by using the communication manager's restoration function.
         """
+        if self.skip_permutation_for_sonicmoe:
+            return hidden_states
         hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
         return hidden_states
 

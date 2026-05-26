@@ -114,7 +114,7 @@ class TransformerLayerSchedulePlan:
             TransformerLayerNode,
             build_layer_callables,
         )
-        from megatron.core.transformer.moe.moe_layer import MoELayer
+        from megatron.core.transformer.moe.moe_layer import MoELayer, SonicMoELayer
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
         # build the forward and backward callables for the transformer/mtp layer
@@ -123,11 +123,13 @@ class TransformerLayerSchedulePlan:
         # get flags for latter use
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
         transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
-        is_moe = isinstance(transformer_layer.mlp, MoELayer)
+        is_sonic_moe = isinstance(transformer_layer.mlp, SonicMoELayer)
+        is_moe = isinstance(transformer_layer.mlp, (MoELayer, SonicMoELayer))
         num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
+        extra_args["is_sonic_moe"] = is_sonic_moe
         extra_args["num_local_experts"] = num_local_experts
         extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
         extra_args["is_mtp"] = is_mtp

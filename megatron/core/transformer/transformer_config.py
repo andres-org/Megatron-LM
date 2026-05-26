@@ -731,6 +731,9 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
+    moe_use_sonicmoe: bool = False
+    """Use SonicMoE kernels through SonicMoELayer."""
+
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
@@ -1238,6 +1241,22 @@ class TransformerConfig(ModelParallelConfig):
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
                 )
+
+        if self.moe_use_sonicmoe:
+            if self.tensor_model_parallel_size != 1:
+                raise ValueError("SonicMoELayer currently requires tensor_model_parallel_size=1.")
+            if self.context_parallel_size != 1:
+                raise ValueError("SonicMoELayer currently requires context_parallel_size=1.")
+            if self.fp8 is not None or self.fp4 is not None:
+                raise ValueError("SonicMoELayer does not support fp8/fp4.")
+            if self.moe_latent_size is not None:
+                raise ValueError("SonicMoELayer does not support moe_latent_size.")
+            if self.moe_shared_expert_overlap:
+                raise ValueError("SonicMoELayer does not support shared expert overlap.")
+            if self.expert_model_parallel_size > 1 and self.moe_token_dispatcher_type != "flex":
+                raise ValueError("SonicMoELayer with EP>1 requires the flex token dispatcher.")
+            if self.moe_token_dispatcher_type == "flex" and self.moe_flex_dispatcher_backend != "deepep":
+                raise ValueError("SonicMoELayer flex dispatch currently requires the DeepEP backend.")
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:

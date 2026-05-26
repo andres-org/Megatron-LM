@@ -16,7 +16,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, SonicMoELayer
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     get_mtp_layer_offset,
@@ -44,7 +44,7 @@ def weak_method(method):
 
 
 @internal_api
-def should_free_input(name, is_moe, config, num_local_experts):
+def should_free_input(name, is_moe, config, num_local_experts, is_sonic_moe=False):
     """Determine if the node should free its input memory.
 
     Args:
@@ -82,6 +82,8 @@ def should_free_input(name, is_moe, config, num_local_experts):
         # passed to GroupedGemm and should be saved for backward pass.
         free_mlp = num_local_experts > 1 or config.moe_token_dispatcher_type != "alltoall"
         free_mlp = free_mlp and not enable_hybridep
+    if is_sonic_moe:
+        free_mlp = False
 
     free_input_nodes = {
         "mlp": free_mlp,
@@ -269,8 +271,9 @@ class TransformerLayerNode(ScheduleNode):
         config = extra_args.get("config", None)
         assert config is not None, "model config must be passed to TransformerLayerNode."
         is_moe = extra_args.get("is_moe", False)
+        is_sonic_moe = extra_args.get("is_sonic_moe", False)
         num_local_experts = extra_args.get("num_local_experts", None)
-        free_input = should_free_input(name, is_moe, config, num_local_experts)
+        free_input = should_free_input(name, is_moe, config, num_local_experts, is_sonic_moe)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
         super().__init__(
@@ -432,7 +435,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         - backward_dw: Dict of weight gradient functions for the layer
     """
 
-    is_moe = isinstance(layer.mlp, MoELayer)
+    is_sonic_moe = isinstance(layer.mlp, SonicMoELayer)
+    is_moe = isinstance(layer.mlp, (MoELayer, SonicMoELayer))
     enable_deepep = (
         layer.config.moe_token_dispatcher_type == "flex"
         and layer.config.moe_flex_dispatcher_backend == "deepep"
@@ -476,7 +480,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                 )
-                if not isinstance(layer.mlp, MoELayer):
+                if not isinstance(layer.mlp, (MoELayer, SonicMoELayer)):
                     return hidden_states, None, None, None
                 if layer.recompute_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -510,7 +514,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
-        if not isinstance(layer.mlp, MoELayer):
+        if not isinstance(layer.mlp, (MoELayer, SonicMoELayer)):
             return hidden_states
 
         # Detach here for mlp_bda residual connection
@@ -528,7 +532,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep or enable_hybridep:
+        if (enable_deepep or enable_hybridep) and not is_sonic_moe:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
@@ -548,7 +552,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep or enable_hybridep:
+        if (enable_deepep or enable_hybridep) and not is_sonic_moe:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
@@ -646,7 +650,7 @@ def build_mtp_layer_callables(layer):
 
     forward_funcs, backward_dw = build_transformer_layer_callables(layer.mtp_model_layer)
     attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
-    is_moe = isinstance(layer.mtp_model_layer.mlp, MoELayer)
+    is_moe = isinstance(layer.mtp_model_layer.mlp, (MoELayer, SonicMoELayer))
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
     def submodule_mtp_attn_forward(node, hidden_states):

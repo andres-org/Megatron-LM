@@ -10,7 +10,7 @@ from megatron.core.models.backends import (
     LocalSpecProvider,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules, SonicMoELayer
 from megatron.core.transformer.moe.router import InferenceTopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -20,6 +20,7 @@ def get_moe_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
+    moe_use_sonicmoe: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE.
 
@@ -37,7 +38,10 @@ def get_moe_module_spec(
     else:
         backend = LocalSpecProvider()
     return get_moe_module_spec_for_backend(
-        backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
+        backend=backend,
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+        moe_use_sonicmoe=moe_use_sonicmoe,
     )
 
 
@@ -46,9 +50,13 @@ def get_moe_module_spec_for_backend(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     use_te_activation_func: bool = False,
+    moe_use_sonicmoe: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE"""
     assert num_experts is not None
+
+    if moe_use_sonicmoe:
+        return ModuleSpec(module=SonicMoELayer)
 
     linear_fc1 = backend.column_parallel_linear()
     linear_fc2 = backend.row_parallel_linear()

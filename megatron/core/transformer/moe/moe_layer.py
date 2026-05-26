@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from functools import partial
+from typing import Optional, Protocol, Tuple
 
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import (
+    LocalNonpersistentObject,
+    ReplicaId,
+    ShardedTensorFactory,
+)
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -29,6 +37,11 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceCUDAGraphTokenDispatcher,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    make_sharded_object_for_checkpoint,
+    sharded_state_dict_default,
+)
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api
 
@@ -52,6 +65,21 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 else:
     TELinear, te_checkpoint = None, None
+
+
+class _ConnectGradientWithZeros(torch.autograd.Function):
+    """Connect a tensor to the graph with an explicit zero gradient."""
+
+    @staticmethod
+    def forward(ctx, output, tensor_to_connect):
+        ctx.shape = tensor_to_connect.shape
+        ctx.dtype = tensor_to_connect.dtype
+        ctx.device = tensor_to_connect.device
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, torch.zeros(ctx.shape, dtype=ctx.dtype, device=ctx.device)
 
 
 class ExpertsInterface(Protocol):
@@ -653,3 +681,666 @@ class MoELayer(BaseMoELayer):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.shared_experts.linear_fc1)
+
+
+class _SonicMoEExpertCompute(MegatronModule):
+    """Expert weights and SonicMoE expert compute used by SonicMoELayer."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        num_local_experts: int,
+        num_global_experts: int,
+        expert_parallel: bool,
+        pg_collection: ProcessGroupCollection,
+    ):
+        super().__init__(config=config)
+
+        from megatron.core.transformer.moe.sonicmoe_util import (
+            assert_sonicmoe_is_available,
+            get_sonicmoe_activation,
+        )
+
+        assert_sonicmoe_is_available()
+        self.num_local_experts = num_local_experts
+        self.hidden_size = config.hidden_size
+        self.ffn_hidden_size = not_none(config.moe_ffn_hidden_size)
+        self.gated_linear_unit = config.gated_linear_unit
+        self.activation_type = get_sonicmoe_activation(config)
+        self.ep_group = pg_collection.ep
+        self.tp_group = pg_collection.expt_tp
+        self.dp_group = pg_collection.expt_dp
+        self.num_global_experts = num_global_experts
+        self._stream_id = None
+
+        w1_out = self.ffn_hidden_size * 2 if config.gated_linear_unit else self.ffn_hidden_size
+        device = None if config.use_cpu_initialization else torch.cuda.current_device()
+        self._weight1_storage = torch.nn.Parameter(
+            torch.empty(
+                num_local_experts,
+                w1_out,
+                self.hidden_size,
+                dtype=config.params_dtype,
+                device=device,
+            )
+        )
+        self._weight2_storage = torch.nn.Parameter(
+            torch.empty(
+                num_local_experts,
+                self.hidden_size,
+                self.ffn_hidden_size,
+                dtype=config.params_dtype,
+                device=device,
+            )
+        )
+        setattr(self._weight1_storage, "allreduce", not expert_parallel)
+        setattr(self._weight2_storage, "allreduce", not expert_parallel)
+
+        self.bias1 = None
+        self.bias2 = None
+        if config.add_bias_linear:
+            self.bias1 = torch.nn.Parameter(
+                torch.empty(num_local_experts, w1_out, dtype=config.params_dtype, device=device)
+            )
+            self.bias2 = torch.nn.Parameter(
+                torch.empty(
+                    num_local_experts, self.hidden_size, dtype=config.params_dtype, device=device
+                )
+            )
+            setattr(self.bias1, "allreduce", not expert_parallel)
+            setattr(self.bias2, "allreduce", not expert_parallel)
+
+        if config.perform_initialization:
+            self.init_weights(config)
+
+    @property
+    def stream_id(self):
+        if self._stream_id is None:
+            self._stream_id = torch.cuda.current_stream().cuda_stream
+        return self._stream_id
+
+    @property
+    def weight1(self):
+        return self._weight1_storage.permute(1, 2, 0)
+
+    @property
+    def weight2(self):
+        return self._weight2_storage.permute(1, 2, 0)
+
+    def init_weights(self, config: TransformerConfig):
+        config.init_method(self._weight1_storage)
+        config.output_layer_init_method(self._weight2_storage)
+        if self.bias1 is not None:
+            self.bias1.data.zero_()
+        if self.bias2 is not None:
+            self.bias2.data.zero_()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_scores: torch.Tensor,
+        token_indices: torch.Tensor,
+        expert_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        from megatron.core.transformer.moe.sonicmoe_util import moe_general_routing_inputs
+
+        if hidden_states.nelement() == 0:
+            output = hidden_states
+            output = _ConnectGradientWithZeros.apply(output, router_scores)
+            output = _ConnectGradientWithZeros.apply(output, self._weight1_storage)
+            output = _ConnectGradientWithZeros.apply(output, self._weight2_storage)
+            if self.bias1 is not None:
+                output = _ConnectGradientWithZeros.apply(output, self.bias1)
+            if self.bias2 is not None:
+                output = _ConnectGradientWithZeros.apply(output, self.bias2)
+            return output
+
+        output, _ = moe_general_routing_inputs(
+            x=hidden_states,
+            router_scores=router_scores.reshape(-1).float(),
+            token_indices=token_indices.reshape(-1).to(torch.int32),
+            expert_indices=expert_indices.reshape(-1).to(torch.int32),
+            w1=self.weight1,
+            b1=self.bias1,
+            w2=self.weight2,
+            b2=self.bias2,
+            E=self.num_local_experts,
+            stream_id=self.stream_id,
+            activation_type=self.activation_type,
+            is_inference_mode_enabled=not self.training,
+        )
+        return output
+
+    def backward_dw(self):
+        pass
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Build sharded state dict entries compatible with standard MoE checkpoints."""
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        sharded_state_dict = {}
+
+        ep_size = self.ep_group.size()
+        ep_rank = self.ep_group.rank()
+        tp_size = self.tp_group.size()
+        tp_rank = self.tp_group.rank()
+        assert (
+            tp_size == 1
+        ), f"SonicMoELayer does not support tensor parallelism, but tp_size={tp_size}"
+        dp_rank = self.dp_group.rank()
+        local_expert_indices_offset = ep_rank * self.num_local_experts
+
+        prepend_axis_num = len(sharded_offsets)
+        replica_id = (0, 0, dp_rank)
+
+        def _break_into_individual_experts(
+            experts_ten: torch.Tensor,
+            key: str,
+            tp_offset: Tuple[int, int, int],
+            replica_id: ReplicaId,
+        ):
+            experts_state = []
+            assert len(experts_ten) == self.num_local_experts, (
+                experts_ten.shape,
+                self.num_local_experts,
+            )
+            for local_expert_idx, expert_ten in enumerate(experts_ten):
+                global_expert_idx = local_expert_indices_offset + local_expert_idx
+                expert_key = key.replace(
+                    f'{prefix}experts.', f'{prefix}experts.{global_expert_idx}.'
+                )
+                experts_state.append(
+                    ShardedTensor.from_rank_offsets(
+                        expert_key,
+                        expert_ten.contiguous(),
+                        *sharded_offsets,
+                        tp_offset,
+                        replica_id=replica_id,
+                        prepend_axis_num=prepend_axis_num,
+                    )
+                )
+            return experts_state
+
+        def _split_glu_rows_for_checkpoint(t: torch.Tensor):
+            return t[..., 0::2, :], t[..., 1::2, :]
+
+        def _merge_glu_rows_from_checkpoint(w_rows: torch.Tensor, v_rows: torch.Tensor):
+            merged = torch.empty(
+                (*w_rows.shape[:-2], w_rows.shape[-2] + v_rows.shape[-2], w_rows.shape[-1]),
+                dtype=w_rows.dtype,
+                device=w_rows.device,
+            )
+            merged[..., 0::2, :] = w_rows
+            merged[..., 1::2, :] = v_rows
+            return merged
+
+        def _split_glu_bias_for_checkpoint(t: torch.Tensor):
+            return t[..., 0::2], t[..., 1::2]
+
+        def _merge_glu_bias_from_checkpoint(w_bias: torch.Tensor, v_bias: torch.Tensor):
+            merged = torch.empty(
+                (*w_bias.shape[:-1], w_bias.shape[-1] + v_bias.shape[-1]),
+                dtype=w_bias.dtype,
+                device=w_bias.device,
+            )
+            merged[..., 0::2] = w_bias
+            merged[..., 1::2] = v_bias
+            return merged
+
+        @torch.no_grad()
+        def sh_ten_build_fn(
+            key: str,
+            t: torch.Tensor,
+            replica_id: ReplicaId,
+            flattened_range: Optional[slice],
+            tp_axis: int,
+            with_glu: bool,
+        ):
+            if tp_axis not in [0, 1]:
+                raise ValueError("tp_axis should be 0 or 1.")
+
+            if flattened_range is None:
+                if with_glu:
+                    assert tp_axis == 0, tp_axis
+                    if singleton_local_shards:
+                        w_tensor, v_tensor = _split_glu_rows_for_checkpoint(t)
+                        sub_states = {
+                            'singleton_local_shards': LocalNonpersistentObject(True),
+                            'data': {
+                                'w': _break_into_individual_experts(
+                                    w_tensor,
+                                    f'{key}_w',
+                                    (prepend_axis_num, tp_rank, tp_size),
+                                    replica_id,
+                                ),
+                                'v': _break_into_individual_experts(
+                                    v_tensor,
+                                    f'{key}_v',
+                                    (prepend_axis_num, tp_rank, tp_size),
+                                    replica_id,
+                                ),
+                            },
+                        }
+                    else:
+                        local_tensors = _split_glu_rows_for_checkpoint(t)
+                        sub_states = [
+                            ShardedTensor.from_rank_offsets(
+                                key,
+                                local_tensors[0].contiguous(),
+                                *sharded_offsets,
+                                (prepend_axis_num, ep_rank, ep_size),
+                                (prepend_axis_num + 1, tp_rank, tp_size * 2),
+                                replica_id=replica_id,
+                                prepend_axis_num=prepend_axis_num,
+                            ),
+                            ShardedTensor.from_rank_offsets(
+                                key,
+                                local_tensors[1].contiguous(),
+                                *sharded_offsets,
+                                (prepend_axis_num, ep_rank, ep_size),
+                                (prepend_axis_num + 1, tp_size + tp_rank, tp_size * 2),
+                                replica_id=replica_id,
+                                prepend_axis_num=prepend_axis_num,
+                            ),
+                        ]
+                else:
+                    if singleton_local_shards:
+                        sub_states = {
+                            'singleton_local_shards': LocalNonpersistentObject(True),
+                            'data': _break_into_individual_experts(
+                                t, key, (prepend_axis_num + tp_axis, tp_rank, tp_size), replica_id
+                            ),
+                        }
+                    else:
+                        sub_states = ShardedTensor.from_rank_offsets(
+                            key,
+                            t.contiguous(),
+                            *sharded_offsets,
+                            (prepend_axis_num, ep_rank, ep_size),
+                            (prepend_axis_num + 1 + tp_axis, tp_rank, tp_size),
+                            replica_id=replica_id,
+                            prepend_axis_num=prepend_axis_num,
+                        )
+            return sub_states  # pylint: disable=possibly-used-before-assignment
+
+        @torch.no_grad()
+        def sh_ten_merge_fn(sub_state_dict, tp_axis: int, with_glu: bool):
+            if isinstance(sub_state_dict, dict):
+                assert sub_state_dict['singleton_local_shards']
+                if with_glu:
+                    assert isinstance(sub_state_dict['data'], dict)
+                    sub_state_dict = _merge_glu_rows_from_checkpoint(
+                        torch.stack(sub_state_dict['data']['w']),
+                        torch.stack(sub_state_dict['data']['v']),
+                    )
+                else:
+                    assert isinstance(sub_state_dict['data'], list)
+                    sub_state_dict = torch.stack(sub_state_dict['data'])
+            elif with_glu:
+                sub_state_dict = _merge_glu_rows_from_checkpoint(*sub_state_dict)
+            return sub_state_dict
+
+        bias_specs = {
+            'bias1': (f'{prefix}experts.linear_fc1.bias', 0, self.gated_linear_unit),
+            'bias2': (f'{prefix}experts.linear_fc2.bias', None, False),
+        }
+
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        for name, tensor in state_dict.items():
+            if name == '_weight1_storage':
+                tp_axis = 0
+                with_glu = self.gated_linear_unit
+                wkey = f'{prefix}experts.linear_fc1.weight'
+            if name == '_weight2_storage':
+                tp_axis = 1
+                with_glu = False
+                wkey = f'{prefix}experts.linear_fc2.weight'
+            if name in ('_weight1_storage', '_weight2_storage'):
+                sharded_state_dict[f'{prefix}{name}'] = ShardedTensorFactory(
+                    wkey,
+                    tensor,
+                    partial(sh_ten_build_fn, tp_axis=tp_axis, with_glu=with_glu),
+                    partial(sh_ten_merge_fn, tp_axis=tp_axis, with_glu=with_glu),
+                    tuple(copy.deepcopy(replica_id)),
+                )
+                continue
+
+            if name in bias_specs:
+                bias_ckpt_key, bias_tp_axis, bias_with_glu = bias_specs[name]
+
+                def bias_build_fn(
+                    key,
+                    t,
+                    replica_id,
+                    flattened_range,
+                    _bias_ckpt_key=bias_ckpt_key,
+                    _bias_tp_axis=bias_tp_axis,
+                    _bias_with_glu=bias_with_glu,
+                ):
+                    if singleton_local_shards:
+                        if _bias_with_glu:
+                            w_tensor, v_tensor = _split_glu_bias_for_checkpoint(t)
+                            return {
+                                'singleton_local_shards': LocalNonpersistentObject(True),
+                                'data': {
+                                    'w': _break_into_individual_experts(
+                                        w_tensor,
+                                        f'{_bias_ckpt_key}_w',
+                                        (prepend_axis_num, tp_rank, tp_size),
+                                        replica_id,
+                                    ),
+                                    'v': _break_into_individual_experts(
+                                        v_tensor,
+                                        f'{_bias_ckpt_key}_v',
+                                        (prepend_axis_num, tp_rank, tp_size),
+                                        replica_id,
+                                    ),
+                                },
+                            }
+
+                        tp_offset = (
+                            (prepend_axis_num + _bias_tp_axis, tp_rank, tp_size)
+                            if _bias_tp_axis is not None
+                            else None
+                        )
+                        experts_state = []
+                        for local_expert_idx in range(self.num_local_experts):
+                            global_expert_idx = local_expert_indices_offset + local_expert_idx
+                            expert_key = _bias_ckpt_key.replace(
+                                f'{prefix}experts.',
+                                f'{prefix}experts.{global_expert_idx}.',
+                            )
+                            rank_offsets = [*sharded_offsets]
+                            if tp_offset is not None:
+                                rank_offsets.append(tp_offset)
+                            experts_state.append(
+                                ShardedTensor.from_rank_offsets(
+                                    expert_key,
+                                    t[local_expert_idx].contiguous(),
+                                    *rank_offsets,
+                                    replica_id=replica_id,
+                                    prepend_axis_num=prepend_axis_num,
+                                )
+                            )
+                        return {
+                            'singleton_local_shards': LocalNonpersistentObject(True),
+                            'data': experts_state,
+                        }
+
+                    if _bias_with_glu:
+                        local_tensors = _split_glu_bias_for_checkpoint(t)
+                        return [
+                            ShardedTensor.from_rank_offsets(
+                                _bias_ckpt_key,
+                                local_tensors[0].contiguous(),
+                                *sharded_offsets,
+                                (prepend_axis_num, ep_rank, ep_size),
+                                (prepend_axis_num + 1, tp_rank, tp_size * 2),
+                                replica_id=replica_id,
+                                prepend_axis_num=prepend_axis_num,
+                            ),
+                            ShardedTensor.from_rank_offsets(
+                                _bias_ckpt_key,
+                                local_tensors[1].contiguous(),
+                                *sharded_offsets,
+                                (prepend_axis_num, ep_rank, ep_size),
+                                (prepend_axis_num + 1, tp_size + tp_rank, tp_size * 2),
+                                replica_id=replica_id,
+                                prepend_axis_num=prepend_axis_num,
+                            ),
+                        ]
+
+                    rank_offsets = [*sharded_offsets, (prepend_axis_num, ep_rank, ep_size)]
+                    if _bias_tp_axis is not None:
+                        rank_offsets.append(
+                            (prepend_axis_num + 1 + _bias_tp_axis, tp_rank, tp_size)
+                        )
+                    return ShardedTensor.from_rank_offsets(
+                        _bias_ckpt_key,
+                        t,
+                        *rank_offsets,
+                        replica_id=replica_id,
+                        prepend_axis_num=prepend_axis_num,
+                    )
+
+                def bias_merge_fn(sub_state_dict, _bias_with_glu=bias_with_glu):
+                    if isinstance(sub_state_dict, dict):
+                        assert sub_state_dict['singleton_local_shards']
+                        if _bias_with_glu:
+                            assert isinstance(sub_state_dict['data'], dict)
+                            return _merge_glu_bias_from_checkpoint(
+                                torch.stack(sub_state_dict['data']['w']),
+                                torch.stack(sub_state_dict['data']['v']),
+                            )
+                        return torch.stack(sub_state_dict['data'])
+                    if _bias_with_glu:
+                        return _merge_glu_bias_from_checkpoint(*sub_state_dict)
+                    return sub_state_dict
+
+                sharded_state_dict[f'{prefix}{name}'] = ShardedTensorFactory(
+                    bias_ckpt_key,
+                    tensor,
+                    bias_build_fn,
+                    bias_merge_fn,
+                    copy.deepcopy(replica_id),
+                )
+
+        extra_state_replica_id = (0, tp_rank, dp_rank)
+        for expert_local_idx in range(self.num_local_experts):
+            expert_global_idx = local_expert_indices_offset + expert_local_idx
+            if singleton_local_shards:
+                expert_sharded_offsets = sharded_offsets
+            else:
+                expert_sharded_offsets = (
+                    *sharded_offsets,
+                    (len(sharded_offsets), expert_global_idx, self.num_global_experts),
+                )
+            for mod in ['linear_fc1', 'linear_fc2']:
+                if singleton_local_shards:
+                    expert_key = f'{prefix}experts.{expert_global_idx}.{mod}._extra_state'
+                else:
+                    expert_key = f'{prefix}experts.{mod}._extra_state'
+                sharded_state_dict[f'{prefix}expert{expert_global_idx}.{mod}._extra_state'] = (
+                    make_sharded_object_for_checkpoint(
+                        None, expert_key, expert_sharded_offsets, extra_state_replica_id
+                    )
+                )
+
+        return sharded_state_dict
+
+
+class SonicMoELayer(BaseMoELayer):
+    """MoE layer using SonicMoE expert kernels with Megatron routing and flex dispatch."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: Optional[MoESubmodules] = None,
+        layer_number: Optional[int] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+    ):
+        if pg_collection is None:
+            pg_collection = get_default_pg_collection()
+        super().__init__(
+            config=config,
+            layer_number=layer_number,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+        )
+        from megatron.core.transformer.moe.sonicmoe_util import assert_sonicmoe_is_available
+
+        assert_sonicmoe_is_available()
+        self.submodules = submodules
+        self.tp_group = pg_collection.tp
+        self.dp_group = pg_collection.expt_dp
+        self.hidden_size = config.hidden_size
+        self.ffn_hidden_size = not_none(config.moe_ffn_hidden_size)
+        self.num_experts = not_none(config.num_moe_experts)
+        self.top_k = config.moe_router_topk
+        self.ep_size = utils.get_pg_size(self.ep_group)
+        self.expert_parallel = self.ep_size > 1
+        self.moe_layer_recompute = (
+            config.recompute_granularity == 'selective'
+            and "moe" in config.recompute_modules
+            and config.cuda_graph_impl != 'local'
+        )
+        self.shared_experts_recompute = (
+            config.recompute_granularity == 'selective'
+            and "shared_experts" in config.recompute_modules
+        )
+
+        self.router = TopKRouter(
+            config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
+        )
+        self.experts = _SonicMoEExpertCompute(
+            config=config,
+            num_local_experts=self.num_local_experts,
+            num_global_experts=self.num_experts,
+            expert_parallel=self.expert_parallel,
+            pg_collection=pg_collection,
+        )
+
+        self.token_dispatcher = None
+        if self.ep_size > 1 or config.moe_token_dispatcher_type == "flex":
+            if config.moe_token_dispatcher_type != "flex":
+                raise ValueError("SonicMoELayer with EP>1 requires flex token dispatcher.")
+            self.token_dispatcher = MoEFlexTokenDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                pg_collection=pg_collection,
+            )
+
+        if self.use_shared_expert:
+            assert (
+                self.submodules is not None and self.submodules.shared_experts is not None
+            ), "Shared experts builder is not provided in the module spec."
+            self.shared_experts = self.submodules.shared_experts(
+                config=self.config,
+                pg_collection=pg_collection,
+                gate=self.config.moe_shared_expert_gate,
+            )
+
+        def remove_extra_states_check(module, incompatible_keys):
+            for key in list(incompatible_keys.unexpected_keys):
+                if "_extra_state" in key:
+                    incompatible_keys.unexpected_keys.remove(key)
+
+        self.register_load_state_dict_post_hook(remove_extra_states_check)
+
+    def _dense_to_token_expert_metadata(self, probs: torch.Tensor, routing_map: torch.Tensor):
+        router_scores, expert_indices = torch.topk(probs, self.top_k, dim=-1)
+        token_indices = torch.arange(probs.shape[0], device=probs.device).unsqueeze(1)
+        token_indices = token_indices.expand_as(expert_indices)
+        valid_mask = router_scores.reshape(-1) != 0
+        return (
+            router_scores.reshape(-1)[valid_mask],
+            token_indices.reshape(-1)[valid_mask],
+            expert_indices.reshape(-1)[valid_mask],
+        )
+
+    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        return apply_module(self.router)(hidden_states, padding_mask)
+
+    def preprocess(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+    ):
+        self.hidden_shape = hidden_states.shape
+        self._routing_map = routing_map
+        if self.token_dispatcher is None:
+            return hidden_states.view(-1, self.hidden_size), probs, routing_map
+        hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+            hidden_states, routing_map, probs
+        )
+        return hidden_states, probs, routing_map
+
+    def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+        if self.token_dispatcher is None:
+            return hidden_states, probs
+        return self.token_dispatcher.token_dispatch(hidden_states, probs)
+
+    def routed_experts_compute(
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        routing_map: Optional[torch.Tensor] = None,
+    ):
+        if routing_map is None:
+            routing_map = self._routing_map
+        if self.token_dispatcher is None:
+            router_scores, token_indices, expert_indices = self._dense_to_token_expert_metadata(
+                probs, routing_map
+            )
+        else:
+            hidden_states, metadata, _ = self.token_dispatcher.dispatch_postprocess(
+                hidden_states, probs
+            )
+            router_scores = metadata.router_probs.reshape(-1)
+            token_indices = metadata.token_indices.reshape(-1)
+            expert_indices = metadata.expert_indices.reshape(-1)
+            valid_mask = expert_indices >= 0
+            router_scores = router_scores[valid_mask]
+            token_indices = token_indices[valid_mask]
+            expert_indices = expert_indices[valid_mask]
+
+        output = apply_module(self.experts)(
+            hidden_states, router_scores, token_indices, expert_indices
+        )
+        if self.token_dispatcher is not None:
+            output = self.token_dispatcher.combine_preprocess(output)
+        return output, None
+
+    def combine(self, output: torch.Tensor):
+        if self.token_dispatcher is None:
+            return output
+        return self.token_dispatcher.token_combine(output)
+
+    def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
+        if self.token_dispatcher is not None:
+            output = self.token_dispatcher.combine_postprocess(output)
+        else:
+            output = output.view(self.hidden_shape)
+        if shared_expert_output is not None:
+            output = output + shared_expert_output
+        return output
+
+    def shared_experts_compute(self, hidden_states: torch.Tensor):
+        if not self.use_shared_expert:
+            return None
+        if self.shared_experts_recompute:
+            return tensor_parallel.checkpoint(apply_module(self.shared_experts), False, hidden_states)
+        return apply_module(self.shared_experts)(hidden_states)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        intermediate_tensors=None,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
+        if padding_mask is not None:
+            padding_mask = padding_mask.transpose(0, 1).bool()
+
+        def custom_forward(hidden_states, padding_mask=None):
+            shared_expert_output = self.shared_experts_compute(hidden_states)
+            probs, routing_map = self.route(hidden_states, padding_mask=padding_mask)
+            hidden_states, probs, routing_map = self.preprocess(hidden_states, probs, routing_map)
+            hidden_states, probs = self.dispatch(hidden_states, probs)
+            output, mlp_bias = self.routed_experts_compute(hidden_states, probs, routing_map)
+            output = self.combine(output)
+            output = self.postprocess(output, shared_expert_output)
+            return output, mlp_bias
+
+        if self.moe_layer_recompute and self.training:
+            outputs = tensor_parallel.checkpoint(
+                custom_forward, False, hidden_states, padding_mask
+            )
+        else:
+            outputs = custom_forward(hidden_states, padding_mask)
+        return outputs
+
+    def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
+        if routed_experts:
+            self.experts.backward_dw()
+        if shared_experts and self.use_shared_expert:
+            self.shared_experts.backward_dw()
