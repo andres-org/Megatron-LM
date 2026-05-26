@@ -11,7 +11,8 @@ import pytest
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.utils import Split
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.tokenizers import MegatronTokenizer
 from tests.unit_tests.test_utilities import Utils
@@ -26,6 +27,84 @@ def sample_N(dataset, N, randomize):
         indices = list(range(N))
     samples = [dataset[index]["tokens"].numpy() for index in indices]
     return samples
+
+
+class _DeterministicLowLevelDataset:
+    def __len__(self):
+        return 1
+
+
+class _LoadedPathLowLevelDataset:
+    def __init__(self, documents):
+        self.documents = [numpy.array(document, dtype=numpy.int64) for document in documents]
+        self.sequence_lengths = numpy.array(
+            [document.shape[0] for document in self.documents], dtype=numpy.int32
+        )
+        self.get_calls = []
+
+    def __len__(self):
+        return len(self.documents)
+
+    def get(self, idx, offset=0, length=None):
+        self.get_calls.append((idx, offset, length))
+        document = self.documents[idx]
+        if length is None:
+            return document[offset:].copy()
+        return document[offset : offset + length].copy()
+
+
+class _LoadedPathGPTDataset(GPTDataset):
+    def __init__(self, low_level_dataset, config):
+        super().__init__(
+            low_level_dataset,
+            None,
+            numpy.arange(len(low_level_dataset), dtype=numpy.int64),
+            1,
+            Split.train,
+            config,
+        )
+
+    @staticmethod
+    def build_low_level_dataset(dataset_path, config):
+        raise NotImplementedError
+
+    def _build_document_sample_shuffle_indices(self):
+        return (
+            numpy.array([0, 1, 2], dtype=numpy.int64),
+            numpy.array([[0, 0], [2, 3]], dtype=numpy.int64),
+            numpy.array([0], dtype=numpy.uint32),
+        )
+
+
+class _DeterministicGPTDataset(GPTDataset):
+    def __init__(self, sample, config):
+        self._sample = numpy.array(sample, dtype=numpy.int64)
+        super().__init__(
+            _DeterministicLowLevelDataset(),
+            None,
+            numpy.array([0], dtype=numpy.int64),
+            1,
+            Split.train,
+            config,
+        )
+
+    @staticmethod
+    def numel_low_level_dataset(low_level_dataset):
+        return len(low_level_dataset)
+
+    @staticmethod
+    def build_low_level_dataset(dataset_path, config):
+        raise NotImplementedError
+
+    def _build_document_sample_shuffle_indices(self):
+        return (
+            numpy.array([0], dtype=numpy.int64),
+            numpy.array([[0, 0], [0, 0]], dtype=numpy.int64),
+            numpy.array([0], dtype=numpy.uint32),
+        )
+
+    def _query_document_sample_shuffle_indices(self, idx):
+        return self._sample.copy(), numpy.array([0], dtype=numpy.int64)
 
 
 def test_mock_gpt_dataset():
@@ -111,6 +190,108 @@ def test_mock_gpt_dataset():
 
     # Check handling of None index
     assert not torch.any(sample['loss_mask'])
+
+
+@pytest.mark.parametrize("create_attention_mask", [True, False])
+def test_gpt_dataset_cu_seqlens_from_eod_boundaries(create_attention_mask):
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+
+    config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=8,
+        split="1,0,0",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=create_attention_mask,
+        add_extra_token_to_sequence=False,
+        use_packed_seq_params=True,
+        tokenizer=tokenizer,
+    )
+
+    sample = [11, tokenizer.eod, 21, 22, tokenizer.eod, 31, 32, 33]
+    dataset = _DeterministicGPTDataset(sample, config)
+
+    item = dataset[0]
+
+    assert torch.equal(item["cu_seqlens"], torch.tensor([0, 2, 5, 8], dtype=torch.int32))
+    assert item["max_seqlen"].dtype == torch.int32
+    assert item["max_seqlen"].item() == 3
+    if create_attention_mask:
+        assert "attention_mask" in item
+    else:
+        assert "attention_mask" not in item
+
+
+def test_gpt_dataset_cu_seqlens_created_after_loading_multiple_documents():
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+
+    config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=10,
+        split="1,0,0",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=False,
+        add_extra_token_to_sequence=False,
+        use_packed_seq_params=True,
+        tokenizer=tokenizer,
+    )
+
+    low_level_dataset = _LoadedPathLowLevelDataset(
+        [
+            [10, 11, tokenizer.eod],
+            [20, 21, 22, tokenizer.eod],
+            [30, 31, tokenizer.eod],
+        ]
+    )
+    dataset = _LoadedPathGPTDataset(low_level_dataset, config)
+
+    item = dataset[0]
+
+    assert torch.equal(
+        item["tokens"],
+        torch.tensor(
+            [10, 11, tokenizer.eod, 20, 21, 22, tokenizer.eod, 30, 31, tokenizer.eod],
+            dtype=torch.int64,
+        ),
+    )
+    assert torch.equal(item["cu_seqlens"], torch.tensor([0, 3, 7, 10], dtype=torch.int32))
+    assert item["max_seqlen"].dtype == torch.int32
+    assert item["max_seqlen"].item() == 4
+    assert low_level_dataset.get_calls == [(0, 0, None), (1, 0, None), (2, 0, 3)]
+
+
+def test_gpt_dataset_cu_seqlens_without_eod():
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+
+    config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=6,
+        split="1,0,0",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=False,
+        add_extra_token_to_sequence=False,
+        use_packed_seq_params=True,
+        tokenizer=tokenizer,
+    )
+
+    sample = [11, 12, 13, 14, 15, 16]
+    dataset = _DeterministicGPTDataset(sample, config)
+
+    item = dataset[0]
+
+    assert torch.equal(item["cu_seqlens"], torch.tensor([0, 6], dtype=torch.int32))
+    assert item["max_seqlen"].item() == 6
 
 
 if __name__ == "__main__":

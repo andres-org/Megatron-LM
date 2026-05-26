@@ -242,6 +242,16 @@ class MultiLatentAttention(Attention):
         ), "cache_mla_latents conflicts with training."
 
         # hidden_states: [sq, b, h]
+        # When packed sequences are active with b > 1, transpose to have the samples be contiguous and fold batch into the seq dim so the rest of attention sees the canonical [t, 1, h] (thd) shape.
+        orig_bsz = hidden_states.shape[1]
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and orig_bsz > 1
+        ):
+            sq = hidden_states.shape[0]
+            h = hidden_states.shape[2]
+            hidden_states = hidden_states.transpose(0, 1).contiguous().view(sq * orig_bsz, 1, h)
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
         if inference_context and not inference_context.is_static_batching():
@@ -370,6 +380,9 @@ class MultiLatentAttention(Attention):
             output = off_interface.group_commit(
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
+
+        if orig_bsz > 1 and packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            output = output.view(orig_bsz, sq, -1).transpose(0, 1).contiguous()
 
         return output, bias
 

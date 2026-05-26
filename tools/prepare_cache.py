@@ -1,0 +1,379 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Prepare GPT dataset caches ahead of training.
+
+Unsupported configurations:
+    --mock-data, --sft, --fim-data, --step-batch-size-schedule
+"""
+
+import argparse
+import json
+from typing import Any, Dict, List, Optional, Tuple
+import os
+import torch.distributed as dist
+
+from megatron.core.datasets.blended_dataset import BlendedDataset
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
+from megatron.core.datasets.utils import compile_helpers
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.training import get_train_valid_test_num_samples
+from megatron.training.arguments import parse_args, validate_args
+from megatron.training.global_vars import set_args, unset_global_variables
+from megatron.training.training import update_train_iters
+from megatron.training.utils import get_blend_and_blend_per_split
+
+try:
+    from megatron.post_training.arguments import add_modelopt_args
+
+    has_nvidia_modelopt = True
+except ImportError:
+    has_nvidia_modelopt = False
+
+
+def add_prepare_cache_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add cache-preparation specific arguments."""
+
+    group = parser.add_argument_group(title="prepare cache")
+    group.add_argument(
+        "--prepare-cache-world-size",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for the effective world size used to derive data-parallel size and "
+            "dataset sample counts during cache preparation."
+        ),
+    )
+
+    group.add_argument(
+        "--prepare-cache-manifest-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to write a small JSON manifest describing the generated dataset cache. "
+            "The manifest records the cache .npy files and source .bin/.idx prefixes needed by "
+            "a query tool to resolve arbitrary training batches."
+        ),
+    )
+
+    return parser
+
+
+def _extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser = add_prepare_cache_args(parser)
+    if has_nvidia_modelopt:
+        parser = add_modelopt_args(parser)
+    return parser
+
+
+def _normalize_prepare_cache_args(args: Any) -> None:
+    """Apply cache-preparation specific argument normalization."""
+
+    args.rank = 0
+
+    if args.prepare_cache_world_size is not None:
+        if args.prepare_cache_world_size <= 0:
+            raise ValueError("--prepare-cache-world-size must be positive")
+        args.world_size = args.prepare_cache_world_size
+
+
+def _validate_prepare_cache_args(args: Any) -> None:
+    """Validate options that are intentionally unsupported for offline cache prep."""
+
+    if args.data_cache_path is None:
+        raise ValueError("--data-cache-path must be provided for cache preparation")
+    if args.mock_data:
+        raise ValueError("--mock-data is not supported by tools/prepare_cache.py")
+    if getattr(args, "sft", False):
+        raise ValueError("--sft is not supported by tools/prepare_cache.py")
+    if getattr(args, "fim_data", False):
+        raise ValueError("--fim-data is not supported by tools/prepare_cache.py")
+    if getattr(args, "step_batch_size_schedule", None) is not None:
+        raise ValueError(
+            "--step-batch-size-schedule is not supported by tools/prepare_cache.py"
+        )
+
+
+def _disable_cache_load_only_flags(args: Any) -> Dict[str, bool]:
+    """Disable flags that only make sense when consuming an existing cache."""
+
+    ignored = {
+        "dataloader_fast_cache_load": bool(args.dataloader_fast_cache_load),
+        "dataloader_defer_npy_index_mmap": bool(args.dataloader_defer_npy_index_mmap),
+    }
+    args.dataloader_fast_cache_load = False
+    args.dataloader_defer_npy_index_mmap = False
+    return ignored
+
+
+def _get_dataset_length(dataset: Optional[Any]) -> Optional[Any]:
+    if dataset is None:
+        return None
+    if isinstance(dataset, list):
+        return [len(ds) if ds is not None else None for ds in dataset]
+    return len(dataset)
+
+
+def _cache_file_path(dataset: Any, suffix: str) -> Optional[str]:
+    """Return the standard cache path for a built BlendedDataset or GPTDataset index file."""
+    path_to_cache = getattr(getattr(dataset, "config", None), "path_to_cache", None)
+    if path_to_cache is None:
+        return None
+
+    split = getattr(dataset, "split", None)
+    if split is None:
+        split = getattr(dataset, "index_split", None)
+    split_name = getattr(split, "name", None)
+    if split_name is None:
+        return None
+
+    return os.path.join(
+        path_to_cache,
+        f"{dataset.unique_description_hash}-{type(dataset).__name__}-{split_name}-{suffix}",
+    )
+
+
+def _manifest_for_gpt_dataset(dataset: GPTDataset, dataset_id: Optional[int] = None) -> Dict[str, Any]:
+    """Return manifest metadata for one source GPTDataset."""
+    low_level_dataset = dataset.dataset
+    source_path = low_level_dataset.path_prefix
+    index = low_level_dataset.index
+    index_mmap = index.bin_buffer_mmap
+    actual_idx_path = os.path.realpath(index_mmap.filename)
+    actual_bin_path = os.path.realpath(f"{source_path}.bin")
+    actual_source_path = actual_bin_path[: -len(".bin")]
+
+    entry = {
+        "type": type(dataset).__name__,
+        "dataset_id": dataset_id,
+        "split": dataset.index_split.name,
+        "length": len(dataset),
+        "num_samples": dataset.num_samples,
+        "dataset_path": actual_source_path,
+        "bin_path": actual_bin_path,
+        "idx_path": actual_idx_path,
+        "cache": {
+            "description": _cache_file_path(dataset, "description.txt"),
+            "document_index": _cache_file_path(dataset, "document_index.npy"),
+            "sample_index": _cache_file_path(dataset, "sample_index.npy"),
+            "shuffle_index": _cache_file_path(dataset, "shuffle_index.npy"),
+        },
+    }
+
+    entry["indexed_dataset"] = {
+        "path_prefix": actual_source_path,
+        "idx_path": actual_idx_path,
+        "dtype": str(index.dtype),
+        "dtype_size": index.dtype_size,
+        "sequence_count": index.sequence_count,
+        "document_count": index.document_count,
+    }
+
+    return entry
+
+
+def _manifest_for_dataset(dataset: Optional[Any]) -> Optional[Any]:
+    """Return manifest metadata for a train/validation/test dataset object."""
+    if dataset is None:
+        return None
+    if isinstance(dataset, list):
+        return [_manifest_for_dataset(child) for child in dataset]
+    if isinstance(dataset, BlendedDataset):
+        return {
+            "type": type(dataset).__name__,
+            "split": dataset.split.name,
+            "length": len(dataset),
+            "size": dataset.size,
+            "cache": {
+                "description": _cache_file_path(dataset, "description.txt"),
+                "dataset_index": _cache_file_path(dataset, "dataset_index.npy"),
+                "dataset_sample_index": _cache_file_path(dataset, "dataset_sample_index.npy"),
+            },
+            "datasets": [
+                _manifest_for_gpt_dataset(child, dataset_id)
+                for dataset_id, child in enumerate(dataset.datasets)
+            ],
+        }
+    if isinstance(dataset, GPTDataset):
+        return _manifest_for_gpt_dataset(dataset, 0)
+
+    return {
+        "type": type(dataset).__name__,
+        "length": len(dataset),
+    }
+
+
+def _write_prepare_cache_manifest(
+    path: str,
+    args: Any,
+    train_valid_test_num_samples: Any,
+    train_ds: Optional[Any],
+    valid_ds: Optional[Any],
+    test_ds: Optional[Any],
+) -> Dict[str, Any]:
+    """Write a small JSON manifest pointing at the generated Megatron dataset cache files."""
+    manifest = {
+        "format": "megatron_dataset_cache_manifest_v1",
+        "world_size": args.world_size,
+        "data_parallel_size": args.data_parallel_size,
+        "global_batch_size": args.global_batch_size,
+        "micro_batch_size": args.micro_batch_size,
+        "train_iters": args.train_iters,
+        "train_samples": args.train_samples,
+        "seed": args.seed,
+        "seq_length": args.seq_length,
+        "split": args.split,
+        "data_cache_path": args.data_cache_path,
+        "train_valid_test_num_samples": list(train_valid_test_num_samples),
+        "splits": {
+            "train": _manifest_for_dataset(train_ds),
+            "validation": _manifest_for_dataset(valid_ds),
+            "test": _manifest_for_dataset(test_ds),
+        },
+    }
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as writer:
+        json.dump(manifest, writer, indent=2, sort_keys=True)
+        writer.write("\n")
+    print(f"> wrote dataset cache manifest to {path}")
+    return manifest
+
+
+def _print_effective_configuration(
+    args: Any, train_valid_test_num_samples: Any, ignored_flags: Dict[str, bool]
+) -> None:
+    print("> preparing dataset cache with the following effective values:")
+    print(f"  world size:         {args.world_size}")
+    print(f"  data parallel size: {args.data_parallel_size}")
+    print(f"  global batch size:  {args.global_batch_size}")
+    print(f"  cache path:         {args.data_cache_path}")
+    print(" > datasets target sizes (minimum size):")
+    print(f"    train:      {train_valid_test_num_samples[0]}")
+    print(f"    validation: {train_valid_test_num_samples[1]}")
+    print(f"    test:       {train_valid_test_num_samples[2]}")
+    if ignored_flags["dataloader_fast_cache_load"]:
+        print("> ignoring --dataloader-fast-cache-load during cache preparation")
+    if ignored_flags["dataloader_defer_npy_index_mmap"]:
+        print("> ignoring --dataloader-defer-npy-index-mmap during cache preparation")
+
+
+def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
+    """Build the explicit GPTDatasetConfig used for offline cache preparation."""
+
+    tokenizer = build_tokenizer(args)
+
+    blend: Optional[Tuple[List[str], Optional[List[float]]]]
+    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+    blend, blend_per_split = get_blend_and_blend_per_split(args)
+
+    sequences_per_dataset = None
+    if args.per_dataset_sequences_path is not None:
+        with open(args.per_dataset_sequences_path, "r") as f:
+            sequences_per_dataset = json.load(f)
+
+    return GPTDatasetConfig(
+        random_seed=args.seed,
+        sequence_length=args.seq_length,
+        blend=blend,
+        blend_per_split=blend_per_split,
+        split=args.split,
+        multiple_validation_sets=args.multiple_validation_sets,
+        full_validation=args.full_validation,
+        num_dataset_builder_threads=args.num_dataset_builder_threads,
+        path_to_cache=args.data_cache_path,
+        mmap_bin_files=args.mmap_bin_files,
+        tokenizer=tokenizer,
+        reset_position_ids=args.reset_position_ids,
+        reset_attention_mask=args.reset_attention_mask,
+        eod_mask_loss=args.eod_mask_loss,
+        create_attention_mask=args.create_attention_mask_in_dataloader,
+        object_storage_cache_path=args.object_storage_cache_path,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
+        fast_cache_load=args.dataloader_fast_cache_load,
+        sequences_per_dataset=sequences_per_dataset,
+        defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
+        context_parallel_size=args.context_parallel_size,
+        data_parallel_size=args.data_parallel_size,
+        sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
+        hybrid_context_parallel=args.hybrid_context_parallel,
+    )
+
+
+def build_dataset_caches(args: Any) -> Dict[str, Any]:
+    """Build the dataset caches for the plain GPTDataset path."""
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="gloo",
+            rank=int(os.environ.get("RANK", 0)),
+            world_size=int(os.environ.get("WORLD_SIZE", 1)),
+        )
+
+    assert dist.get_world_size() == 1, "tools/prepare_cache.py only supports world size of 1"
+    assert args.data_parallel_size == 1 and args.tensor_model_parallel_size == 1 and args.pipeline_model_parallel_size == 1 and args.expert_model_parallel_size == 1, "tools/prepare_cache.py only supports data_parallel_size, tensor_model_parallel_size, pipeline_model_parallel_size, and expert_model_parallel_size of 1"
+
+    _validate_prepare_cache_args(args)
+    ignored_flags = _disable_cache_load_only_flags(args)
+
+    unset_global_variables()
+    set_args(args)
+
+    try:
+        # Derive train_iters from --train-samples when needed (pretrain() does the same).
+        update_train_iters(args)
+        train_valid_test_num_samples = get_train_valid_test_num_samples()
+        _print_effective_configuration(args, train_valid_test_num_samples, ignored_flags)
+
+        compile_helpers()
+
+        config = core_gpt_dataset_config_from_args(args)
+        train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+            GPTDataset, train_valid_test_num_samples, lambda: True, config
+        ).build()
+
+        print("> finished preparing dataset cache")
+        print(f"  train dataset length:      {_get_dataset_length(train_ds)}")
+        print(f"  validation dataset length: {_get_dataset_length(valid_ds)}")
+        print(f"  test dataset length:       {_get_dataset_length(test_ds)}")
+
+        manifest = None
+        if args.prepare_cache_manifest_path is not None:
+            manifest = _write_prepare_cache_manifest(
+                args.prepare_cache_manifest_path,
+                args,
+                train_valid_test_num_samples,
+                train_ds,
+                valid_ds,
+                test_ds,
+            )
+
+        return {
+            "world_size": args.world_size,
+            "data_parallel_size": args.data_parallel_size,
+            "global_batch_size": args.global_batch_size,
+            "train_valid_test_num_samples": tuple(train_valid_test_num_samples),
+            "train_dataset_length": _get_dataset_length(train_ds),
+            "valid_dataset_length": _get_dataset_length(valid_ds),
+            "test_dataset_length": _get_dataset_length(test_ds),
+            "manifest_path": args.prepare_cache_manifest_path,
+            "manifest": manifest,
+        }
+    finally:
+        unset_global_variables()
+
+
+def main() -> Dict[str, Any]:
+    args = parse_args(
+        extra_args_provider=_extra_args_provider,
+        ignore_unknown_args=False,
+    )
+    _normalize_prepare_cache_args(args)
+    validate_args(args, defaults={"tokenizer_type": "GPT2BPETokenizer"})
+    return build_dataset_caches(args)
+
+
+if __name__ == "__main__":
+    main()

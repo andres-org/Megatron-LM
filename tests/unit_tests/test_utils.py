@@ -115,6 +115,85 @@ def test_assert_viewless_tensor():
         assert torch.equal(inp, out)
 
 
+def test_get_batch_on_this_tp_rank_packed_non_src_allocates_dummy_batch():
+    args = SimpleNamespace(
+        sft=False,
+        reset_position_ids=True,
+        hybrid_context_parallel=False,
+        micro_batch_size=2,
+        seq_length=4,
+        pipeline_model_parallel_size=1,
+        create_attention_mask_in_dataloader=True,
+    )
+
+    class _FakeGroup:
+        pass
+
+    broadcast_values = iter(
+        [
+            torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=torch.int64),
+            torch.tensor([[2, 3, 4, 5, 6, 7, 8, 9]], dtype=torch.int64),
+            torch.ones((1, 8), dtype=torch.float32),
+            torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.int64),
+            torch.tensor(3, dtype=torch.int64),
+            torch.tensor([[0, 4, 8]], dtype=torch.int32),
+            torch.tensor([4], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+        ]
+    )
+
+    def fake_broadcast(tensor, src, group):
+        value = next(broadcast_values)
+        tensor.copy_(value.to(device=tensor.device, dtype=tensor.dtype))
+
+    with (
+        mock.patch('megatron.training.utils.get_args', new=lambda: args),
+        mock.patch('megatron.training.utils.mpu.get_tensor_model_parallel_rank', new=lambda: 1),
+        mock.patch('megatron.training.utils.mpu.get_tensor_model_parallel_src_rank', new=lambda: 0),
+        mock.patch('megatron.training.utils.mpu.get_tensor_model_parallel_group', new=lambda: _FakeGroup()),
+        mock.patch('torch.distributed.broadcast', new=fake_broadcast),
+    ):
+        batch = training_util.get_batch_on_this_tp_rank(iter(()))
+
+    assert batch["tokens"].shape == (1, 8)
+    assert batch["labels"].shape == (1, 8)
+    assert batch["loss_mask"].shape == (1, 8)
+    assert batch["position_ids"].shape == (1, 8)
+    assert batch["attention_mask"] is None
+    assert batch["cu_seqlens"].shape == (1, 3)
+    assert batch["max_seqlen"].shape == (1,)
+
+
+def test_get_batch_on_this_tp_rank_packed_rejects_attention_mask():
+    args = SimpleNamespace(
+        sft=False,
+        reset_position_ids=True,
+        hybrid_context_parallel=False,
+        micro_batch_size=2,
+        seq_length=4,
+        pipeline_model_parallel_size=1,
+        create_attention_mask_in_dataloader=True,
+    )
+    batch = {
+        "tokens": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=torch.int64),
+        "labels": torch.tensor([[2, 3, 4, 5, 6, 7, 8, 9]], dtype=torch.int64),
+        "loss_mask": torch.ones((1, 8), dtype=torch.float32),
+        "attention_mask": torch.ones((1, 1, 8, 8), dtype=torch.bool),
+        "position_ids": torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.int64),
+        "cu_seqlens": torch.tensor([[0, 4, 8]], dtype=torch.int32),
+        "max_seqlen": torch.tensor([4], dtype=torch.int32),
+    }
+
+    with (
+        mock.patch('megatron.training.utils.get_args', new=lambda: args),
+        mock.patch('megatron.training.utils.mpu.get_tensor_model_parallel_rank', new=lambda: 0),
+        mock.patch('megatron.training.utils.mpu.get_tensor_model_parallel_src_rank', new=lambda: 0),
+        mock.patch('megatron.training.utils.mpu.get_tensor_model_parallel_group', new=lambda: object()),
+        pytest.raises(AssertionError, match="Packed THD batches do not support dataloader attention masks"),
+    ):
+        training_util.get_batch_on_this_tp_rank(iter([batch]))
+
+
 # Initialize torch.distributed; do not call init_process_group here, call
 # Utils.initialize_distributed() instead.
 def _init_distributed(world, rank):

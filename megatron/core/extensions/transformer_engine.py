@@ -296,6 +296,17 @@ def _get_should_context_be_quantized_params(
         )
 
 
+def _validate_packed_seq_tp_support(
+    packed_seq_params: Optional[PackedSeqParams], tensor_model_parallel_size: int
+) -> None:
+    """Block unsupported TP + THD packed attention combinations early."""
+    if packed_seq_params is None or packed_seq_params.qkv_format != "thd":
+        return
+    assert (
+        tensor_model_parallel_size == 1
+    ), "THD packed attention does not yet support tensor parallelism; set tensor_model_parallel_size=1."
+
+
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {"params_dtype": config.params_dtype}
 
@@ -1557,6 +1568,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         num_splits: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward."""
+        _validate_packed_seq_tp_support(packed_seq_params, self.config.tensor_model_parallel_size)
+
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:

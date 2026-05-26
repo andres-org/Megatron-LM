@@ -777,7 +777,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
         )
-
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
                 # import here to avoid circular import
@@ -1408,7 +1407,9 @@ class MoETransformerLayer(TransformerLayer):
             residual = residual.float()
 
         router_outputs = self.mlp(
-            pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
+            pre_mlp_layernorm_output,
+            intermediate_tensors=(),
+            padding_mask=padding_mask,
         )
 
         for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
@@ -1478,9 +1479,7 @@ class MoETransformerLayer(TransformerLayer):
                 "alongside inference."
             )
 
-        def _forward_mlp_partial_cudagraphs(
-            hidden_states, inference_context=None, padding_mask=None
-        ):
+        def _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=None):
             residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(
                 hidden_states, padding_mask=padding_mask
             )

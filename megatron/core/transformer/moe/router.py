@@ -108,7 +108,11 @@ class Router(ABC, MegatronModule):
         return logits
 
     @abstractmethod
-    def routing(self, logits: torch.Tensor):
+    def routing(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
         """Routing function.
 
         Args:
@@ -121,7 +125,11 @@ class Router(ABC, MegatronModule):
         raise NotImplementedError("Routing function not implemented.")
 
     @abstractmethod
-    def forward(self, input: torch.Tensor):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
         """
         Forward pass of the router.
 
@@ -585,7 +593,11 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def routing(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
         """Top-k routing function
 
         Args:
@@ -710,7 +722,11 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
         """
         Forward pass of the router.
 
@@ -844,7 +860,11 @@ class InferenceTopKRouter(TopKRouter):
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
         """Simplified forward pass for inference - returns dense tensors only.
 
         Args:
@@ -856,7 +876,6 @@ class InferenceTopKRouter(TopKRouter):
                 - probs: Normalized routing probabilities [num_tokens, topk]
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
-
         if self.training or not self.is_inference_cuda_graphed_iteration:
             return super().forward(input, padding_mask)
 

@@ -496,6 +496,7 @@ class TestAuxLossFreeTop2Router:
             torch.testing.assert_close(scores_ref, scores_fused)
 
 
+
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("router_dtype", [torch.bfloat16, torch.float32, torch.float64])

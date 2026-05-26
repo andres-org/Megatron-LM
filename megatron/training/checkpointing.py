@@ -1485,7 +1485,12 @@ def load_args_from_checkpoint(
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
-    _set_arg('apply_layernorm_1p', force=True)
+    if hasattr(checkpoint_args, 'layernorm_zero_centered_gamma'):
+        _set_arg('layernorm_zero_centered_gamma', force=True)
+    else:
+        _set_arg('apply_layernorm_1p', force=True)
+        if hasattr(args, 'apply_layernorm_1p') and hasattr(args, 'layernorm_zero_centered_gamma'):
+            args.layernorm_zero_centered_gamma = args.apply_layernorm_1p
     _set_arg('normalization', force=True)
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)

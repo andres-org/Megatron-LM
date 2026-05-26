@@ -1,6 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import os
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -76,6 +78,7 @@ def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
     schedule.deallocate_output_tensor(out)
     assert out.nelement() == 6
+
 
 
 @pytest.mark.internal

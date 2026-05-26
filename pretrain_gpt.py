@@ -114,8 +114,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """
     args = get_args()
     config = core_transformer_config_from_args(args)
-    # TODO: this is pretty hacky, find a better way
-    is_packed_sequence = get_args().sft  # SFT always uses packed sequence
+    # Temporary policy: route batches through packed-sequence handling whenever
+    # SFT or use_packed_seq_params is enabled.
+    is_packed_sequence = get_args().sft or get_args().use_packed_seq_params
     if not is_first_or_last_pipeline_stage(vp_stage) and not is_packed_sequence and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
         return None, None, None, None, None, None
@@ -130,6 +131,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
     max_seqlen = batch.pop('max_seqlen', None)
     local_cp_size = batch.pop('local_cp_size', None)
+    batch.pop('packed_batch_size', None)
+    batch.pop('seq_length', None)
     if local_cp_size is not None:
         local_cp_size = int(local_cp_size.item())
 
@@ -156,7 +159,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
     elif local_cp_size is None:  # Packed THD format
-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
+        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
+            batch, cu_seqlens, cu_seqlens_padded, max_seqlen
+        )
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
 
@@ -285,7 +290,12 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+                    tokens,
+                    position_ids,
+                    attention_mask,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    packed_seq_params=packed_seq_params,
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -331,6 +341,7 @@ def core_gpt_dataset_config_from_args(args):
         "mmap_bin_files": args.mmap_bin_files,
         "tokenizer": tokenizer,
         "reset_position_ids": args.reset_position_ids,
+        "use_packed_seq_params": args.use_packed_seq_params,
         "reset_attention_mask": args.reset_attention_mask,
         "eod_mask_loss": args.eod_mask_loss,
         "create_attention_mask": args.create_attention_mask_in_dataloader,
@@ -381,10 +392,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     config = core_gpt_dataset_config_from_args(args)
 
 
-    is_packed_sequence = False
+    is_packed_sequence = args.sft or args.use_packed_seq_params
     if args.sft:
         dataset_type = SFTDataset
-        is_packed_sequence = True  # SFT always uses packed sequence
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset
@@ -435,22 +445,24 @@ if __name__ == "__main__":
 
 
     # Set CPU affinity to the NUMA node closest to each GPU for optimal performance.
-    _rank = os.environ.get("RANK", "0")
-    try:
-        from megatron.core.pipeline_parallel.utils import (
-            set_ideal_affinity_for_current_gpu,
-        )
+    # Controlled via MEGATRON_USE_NUMA_AFFINITY=1 env var.
+    if os.environ.get("MEGATRON_USE_NUMA_AFFINITY", "0") == "1":
+        _rank = os.environ.get("RANK", "0")
+        try:
+            from megatron.core.pipeline_parallel.utils import (
+                set_ideal_affinity_for_current_gpu,
+            )
 
-        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
-        affinity_before = os.sched_getaffinity(0)
-        set_ideal_affinity_for_current_gpu()
-        affinity_after = os.sched_getaffinity(0)
-        cores = sorted(affinity_after)
-        print(
-            f"[Rank {_rank}] CPU affinity: {len(affinity_before)} cores -> {len(affinity_after)} cores (range {cores[0]}-{cores[-1]})"
-        )
-    except Exception as e:
-        print(f"[Rank {_rank}] Could not set CPU affinity: {e}")
+            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+            affinity_before = os.sched_getaffinity(0)
+            set_ideal_affinity_for_current_gpu()
+            affinity_after = os.sched_getaffinity(0)
+            cores = sorted(affinity_after)
+            print(
+                f"[Rank {_rank}] CPU affinity: {len(affinity_before)} cores -> {len(affinity_after)} cores (range {cores[0]}-{cores[-1]})"
+            )
+        except Exception as e:
+            print(f"[Rank {_rank}] Could not set CPU affinity: {e}")
 
     pretrain(
         train_valid_test_datasets_provider,

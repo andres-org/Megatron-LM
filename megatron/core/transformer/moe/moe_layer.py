@@ -108,7 +108,12 @@ class SharedExpertsBuilder(Protocol):
 class RouterInterface(Protocol):
     """Interface for the router used in an MoELayer."""
 
-    def forward(self, input: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        input: torch.Tensor,
+        /,
+        padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass of the router.
 
         Returns:
@@ -393,7 +398,11 @@ class MoELayer(BaseMoELayer):
             self.shared_expert_overlap = self._saved_shared_expert_overlap
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
@@ -551,7 +560,7 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    probs, routing_map = self.route(hidden_states, padding_mask=padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:
@@ -603,7 +612,11 @@ class MoELayer(BaseMoELayer):
                 )
             else:
                 outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
+                    custom_forward,
+                    False,
+                    hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
                 )
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)

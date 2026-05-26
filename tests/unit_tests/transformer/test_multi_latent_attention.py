@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
+from copy import deepcopy
 from inspect import signature
 from unittest import mock
 
@@ -268,6 +269,106 @@ class TestParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
             os.environ.clear()
             os.environ.update(_environ)
+
+    def test_gpu_forward_thd_multi_batch(self):
+        """[sq, b, h] input with b>1 and merged THD packed params: output shape matches input."""
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("MLA requires TransformerEngine >= 1.10.0")
+        _environ = os.environ.copy()
+        os.environ['NVTE_FUSED_ATTN'] = "1"
+        os.environ['NVTE_FLASH_ATTN'] = "0"
+
+        config = self.parallel_attention.config
+        sequence_length = 32
+        micro_batch_size = 2
+
+        self.parallel_attention.cuda().bfloat16()
+
+        hidden_states = torch.randn(
+            sequence_length, micro_batch_size, config.hidden_size,
+            dtype=torch.bfloat16, device='cuda',
+        )
+
+        # cu_seqlens must cover the full merged stream of sq*b tokens.
+        single_cu = torch.IntTensor([0, 6, 19, 22, sequence_length]).cuda()
+        merged_cu = torch.cat([single_cu, single_cu[1:] + sequence_length])
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=merged_cu,
+            cu_seqlens_kv=merged_cu,
+            max_seqlen_q=13,
+            max_seqlen_kv=13,
+            qkv_format='thd',
+        )
+        output, bias = self.parallel_attention(
+            hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+
+        assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
+        assert bias.shape == (config.hidden_size,)
+
+        os.environ.clear()
+        os.environ.update(_environ)
+
+    def test_gpu_forward_thd_multi_batch_matches_single_batch(self):
+        """b>1 THD forward matches manually pre-transposed b=1 input with the same merged cu_seqlens."""
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("MLA requires TransformerEngine >= 1.10.0")
+        _environ = os.environ.copy()
+        os.environ['NVTE_FUSED_ATTN'] = "1"
+        os.environ['NVTE_FLASH_ATTN'] = "0"
+
+        deterministic_config = deepcopy(self.transformer_config)
+        deterministic_config.attention_dropout = 0.0
+        self.parallel_attention = MLASelfAttention(
+            deterministic_config,
+            get_mla_self_attn_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        config = self.parallel_attention.config
+        sequence_length = 32
+        micro_batch_size = 2
+
+        self.parallel_attention.cuda().bfloat16()
+
+        torch.manual_seed(42)
+        hidden_states = torch.randn(
+            sequence_length, micro_batch_size, config.hidden_size,
+            dtype=torch.bfloat16, device='cuda',
+        )
+
+        # Build merged cu_seqlens covering sq*b tokens (same as _packed_collate_fn produces).
+        single_cu = torch.IntTensor([0, 6, 19, 22, sequence_length]).cuda()
+        merged_cu = torch.cat([single_cu, single_cu[1:] + sequence_length])
+        merged_params = PackedSeqParams(
+            cu_seqlens_q=merged_cu,
+            cu_seqlens_kv=merged_cu,
+            max_seqlen_q=13,
+            max_seqlen_kv=13,
+            qkv_format='thd',
+        )
+
+        # b>1 forward — internally transposes [sq, b, h] → [sq*b, 1, h] then inverts
+        output_multi, _ = self.parallel_attention(
+            hidden_states, attention_mask=None, packed_seq_params=merged_params
+        )
+
+        # Reference: manually do the same transpose+view and run with b=1
+        hidden_states_thd = hidden_states.transpose(0, 1).contiguous().view(
+            sequence_length * micro_batch_size, 1, config.hidden_size
+        ).bfloat16()
+        output_ref_thd, _ = self.parallel_attention(
+            hidden_states_thd, attention_mask=None, packed_seq_params=merged_params
+        )
+        output_ref = output_ref_thd.view(
+            micro_batch_size, sequence_length, config.hidden_size
+        ).transpose(0, 1).contiguous()
+
+        torch.testing.assert_close(output_multi, output_ref, atol=1e-3, rtol=1e-3)
+
+        os.environ.clear()
+        os.environ.update(_environ)
 
     def test_gpu_forward_thd_padded(self):
         """Test MLA forward pass with cu_seqlens_q_padded and cu_seqlens_kv_padded."""
